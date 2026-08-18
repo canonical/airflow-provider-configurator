@@ -1,0 +1,15 @@
+settings:
+  jira_project_key: "WF"
+  status_mapping:
+    opened: Untriaged
+    closed: Done
+  labels:
+    - bug
+    - enhancement
+  add_gh_comment: true
+  sync_description: true
+  sync_comments: false
+  epic_key: "WF-356"
+  label_mapping:
+    enhancement: Story
+    bug: Bug
