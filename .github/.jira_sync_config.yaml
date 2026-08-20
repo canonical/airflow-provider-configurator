@@ -9,7 +9,7 @@ settings:
   add_gh_comment: true
   sync_description: true
   sync_comments: false
-  epic_key: "WF-356"
+  epic_key: "WF-63"
   label_mapping:
     enhancement: Story
     bug: Bug
