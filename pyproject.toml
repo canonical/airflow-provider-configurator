@@ -1,0 +1,81 @@
+# Copyright 2026 Canonical Ltd.
+# See LICENSE file for licensing details.
+
+[project]
+name = "airflow-provider-configurator"
+version = "0.0"
+requires-python = ">=3.12"
+
+# Dependencies of the charm code.
+# Include the dependencies of the code in src/. Also include the dependencies of
+# any charmlibs that the charm uses (copy the dependencies from their PYDEPS).
+dependencies = [
+    "ops>=3,<4",
+]
+
+[dependency-groups]
+# Dependencies of linting and static type checks
+lint = [
+    "ruff",
+    "codespell",
+]
+format = [
+    "ruff",
+]
+# Dependencies of unit tests
+unit = [
+    "coverage[toml]",
+    "ops[testing]",
+    "pytest",
+]
+# Dependencies of integration tests
+integration = [
+    "jubilant",
+    "pytest",
+    "PyYAML",
+]
+
+# Testing tools configuration
+[tool.coverage.run]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+addopts = "--tb=native --verbose --capture=no --log-cli-level=INFO"
+
+# Linting tools configuration
+[tool.ruff]
+line-length = 99
+lint.select = ["E", "W", "F", "C", "N", "D", "I001"]
+lint.ignore = [
+    "D105",
+    "D107",
+    "D203",
+    "D204",
+    "D213",
+    "D215",
+    "D400",
+    "D404",
+    "D406",
+    "D407",
+    "D408",
+    "D409",
+    "D413",
+]
+extend-exclude = ["__pycache__", "*.egg_info"]
+lint.per-file-ignores = {"tests/*" = ["D100","D101","D102","D103","D104","D205"]}
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.codespell]
+skip = "build,lib,venv,icon.svg,.tox,.git,.mypy_cache,.ruff_cache,.coverage"
+
+[tool.pyright]
+include = ["src", "tests"]
