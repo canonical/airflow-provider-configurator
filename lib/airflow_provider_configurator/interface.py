@@ -30,7 +30,7 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
 
     def _reconcile(self, _):
         self.provider.set_configuration(
-            provider_configuration="[gcs]\\nconn_id = {{ gcs__conn_id }}\\n",
+            provider_configuration="[gcs]\nconn_id = {{ gcs__conn_id }}\n",
             provider_configuration_sensitive_data={"gcs__conn_id": "secret-value"},
         )
 ```
@@ -52,6 +52,8 @@ class AirflowCoordinatorCharm(ops.CharmBase):
 ```
 """
 
+import configparser
+import json
 import typing
 
 import charms.data_platform_libs.v1.data_interfaces as data_interfaces
@@ -62,6 +64,11 @@ DEFAULT_RELATION_NAME = "airflow-provider-configuration"
 # Label of the charm secret (distinct from the user-provided secret) that the
 # provider creates to hold sensitive data and grants to the requirer.
 CHARM_PROVIDER_CONFIG_SECRET_LABEL = "provider-configuration-charm-secret"
+
+# Juju secret keys must be lowercase alphanumeric and cannot contain the
+# double-underscore placeholder names (e.g. "gcs__conn_id"). The sensitive data
+# map is therefore JSON-encoded and stored under this single valid key.
+SENSITIVE_DATA_SECRET_KEY = "sensitive-data"
 
 
 class AirflowProviderConfiguratorProviderModel(data_interfaces.BaseCommonModel):
@@ -100,6 +107,28 @@ class AirflowProviderConfigurationProvides(ops.Object):
             AirflowProviderConfiguratorProviderModel,
         )
 
+    def _set_secret(
+        self,
+        content: dict[str, str],
+        relations: list[ops.Relation],
+    ) -> ops.Secret:
+        """Create or update the charm secret holding the sensitive data.
+
+        Grants the secret to every related application. Returns the Secret so the
+        caller can read its id for the databag.
+        """
+        secret_content = {SENSITIVE_DATA_SECRET_KEY: json.dumps(content)}
+        try:
+            secret = self._charm.model.get_secret(label=CHARM_PROVIDER_CONFIG_SECRET_LABEL)
+            secret.set_content(secret_content)
+        except ops.SecretNotFoundError:
+            secret = self._charm.app.add_secret(
+                secret_content, label=CHARM_PROVIDER_CONFIG_SECRET_LABEL
+            )
+        for relation in relations:
+            secret.grant(relation)
+        return secret
+
     def set_configuration(
         self,
         provider_configuration: str,
@@ -125,14 +154,14 @@ class AirflowProviderConfigurationProvides(ops.Object):
         if not relations:
             return
 
-        # TODO(verify against ops.Secret + data_interfaces before finalising):
-        # 1. Create the charm secret with the sensitive data if it does not exist,
-        #    labelled CHARM_PROVIDER_CONFIG_SECRET_LABEL.
-        # 2. Otherwise, update the existing secret's content with the new data.
-        # 3. Grant the secret to each related application (airflow-coordinator).
-        # 4. Build the model with provider_configuration + the secret id and write
-        #    it to the databag via self._interface.write_model(relation.id, model).
-        raise NotImplementedError("set_configuration body pending secret-API verification")
+        secret = self._set_secret(provider_configuration_sensitive_data, relations)
+
+        model = AirflowProviderConfiguratorProviderModel(
+            provider_configuration=provider_configuration,
+            provider_configuration_secret_id=secret.id,
+        )
+        for relation in relations:
+            self._interface.write_model(relation.id, model)
 
     def clear_configuration(self) -> None:
         """Remove published provider configuration from all relations.
@@ -145,9 +174,15 @@ class AirflowProviderConfigurationProvides(ops.Object):
         if not self._charm.unit.is_leader():
             return
 
-        # TODO(verify): write an empty model to each relation to clear the databag,
-        # and remove/clear the charm secret as appropriate.
-        raise NotImplementedError("clear_configuration body pending secret-API verification")
+        empty = AirflowProviderConfiguratorProviderModel()
+        for relation in self._charm.model.relations[self._relation_name]:
+            self._interface.write_model(relation.id, empty)
+
+        try:
+            secret = self._charm.model.get_secret(label=CHARM_PROVIDER_CONFIG_SECRET_LABEL)
+            secret.remove_all_revisions()
+        except ops.SecretNotFoundError:
+            pass
 
 
 class AirflowProviderConfigurationRequires(ops.Object):
@@ -171,16 +206,28 @@ class AirflowProviderConfigurationRequires(ops.Object):
             AirflowProviderConfiguratorProviderModel,
         )
 
+    def _get_model(self) -> typing.Optional[AirflowProviderConfiguratorProviderModel]:
+        """Read and validate the provider model from the relation databag."""
+        relation = self._charm.model.get_relation(self._relation_name)
+        if not relation or not relation.app:
+            return None
+        try:
+            return self._interface.build_model(
+                relation.id,
+                AirflowProviderConfiguratorProviderModel,
+                component=relation.app,
+            )
+        except Exception:
+            return None
+
     def configurations(self) -> typing.Optional[str]:
         """Return the non-sensitive provider configuration template.
 
         Reads the `provider_configuration` field (a Jinja2 template string) from
         the relation databag. Returns None if there is no relation or no data yet.
         """
-        # TODO(verify): read the model with
-        #   self._interface.build_model(relation.id, ..., component=relation.app)
-        # and return model.provider_configuration.
-        raise NotImplementedError("configurations body pending verification")
+        model = self._get_model()
+        return model.provider_configuration if model else None
 
     def get_sensitive_data(self) -> dict[str, str]:
         """Return the sensitive values held in the provider's charm secret.
@@ -188,9 +235,12 @@ class AirflowProviderConfigurationRequires(ops.Object):
         Resolves `provider_configuration_secret_id` to the charm secret and reads
         its content, returning a mapping of placeholder name to value.
         """
-        # TODO(verify): resolve provider_configuration_secret_id via
-        # self._charm.model.get_secret(id=...).get_content() and return it.
-        raise NotImplementedError("get_sensitive_data body pending verification")
+        model = self._get_model()
+        if not model or not model.provider_configuration_secret_id:
+            return {}
+        secret = self._charm.model.get_secret(id=model.provider_configuration_secret_id)
+        content = secret.get_content(refresh=True)
+        return json.loads(content[SENSITIVE_DATA_SECRET_KEY])
 
     def configuration_keys(self) -> set[str]:
         """Return the set of section.option keys the provider would set.
@@ -198,7 +248,13 @@ class AirflowProviderConfigurationRequires(ops.Object):
         Lets the coordinator detect collisions between provider-supplied
         configuration and the configuration it sets itself (Layer 1 validation).
         """
-        # TODO(verify): parse the provider_configuration template into
-        # section.option keys and return them as a set.
-        raise NotImplementedError("configuration_keys body pending verification")
-
+        model = self._get_model()
+        if not model or not model.provider_configuration:
+            return set()
+        parser = configparser.ConfigParser()
+        parser.read_string(model.provider_configuration)
+        return {
+            f"{section}.{option}"
+            for section in parser.sections()
+            for option in parser.options(section)
+        }
