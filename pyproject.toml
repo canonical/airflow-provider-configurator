@@ -12,7 +12,13 @@ requires-python = ">=3.12"
 dependencies = [
     "ops>=3,<4",
     "pydantic>=2",
+    "airflow-provider-configurator-charmlib",
 ]
+
+# The interface library lives in this same repo under lib/, distributed as a
+# local Python package (Charmhub-hosted libs are deprecated).
+[tool.uv.sources]
+airflow-provider-configurator-charmlib = { path = "lib" }
 
 [dependency-groups]
 # Dependencies of linting and static type checks
