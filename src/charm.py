@@ -34,22 +34,15 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         ):
             self.framework.observe(event, self._reconcile)
 
-        self.framework.observe(self.on.collect_unit_status, self._on_collect_unit_status)
-
     def _reconcile(self, _: ops.EventBase) -> None:
         """Bring the charm to its desired state.
 
-        This is intentionally a no-op for now. Provider configuration handling is
-        added in follow-up work.
+        This is intentionally minimal for now. Provider configuration handling is
+        added in follow-up work. With no configuration sources wired up yet, the
+        charm is always active.
         """
         logger.debug("Reconciling airflow-provider-configurator charm.")
-
-    def _on_collect_unit_status(self, event: ops.CollectStatusEvent) -> None:
-        """Report the unit status.
-
-        With no configuration sources wired up yet, the charm is always active.
-        """
-        event.add_status(ops.ActiveStatus())
+        self.unit.status = ops.ActiveStatus()
 
 
 if __name__ == "__main__":  # pragma: nocover

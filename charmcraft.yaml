@@ -41,6 +41,3 @@ parts:
     source: .
     stage:
       - LICENSE
-  
-config:
-  options: {}
