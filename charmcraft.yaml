@@ -1,0 +1,43 @@
+# This file configures Charmcraft.
+# See https://documentation.ubuntu.com/charmcraft/stable/reference/files/charmcraft-yaml-file/
+type: charm
+name: airflow-provider-configurator
+title: Airflow Provider Configurator
+summary: A charm to configure Airflow providers for Charmed Airflow.
+description: |
+  A charm that lets Charmed Airflow operators configure Airflow providers
+  (connection parameters, credentials, feature flags) without manually editing
+  airflow.cfg.
+
+  Non-sensitive provider configuration is sourced from a git repository via the
+  git-integrator charm; sensitive configuration is supplied through a Juju user
+  secret. The charm relates to the Airflow Coordinator charm to make this
+  configuration available for merging into the deployed Airflow's airflow.cfg.
+
+links:
+  contact: Workflows Team <workflows-charmers@canonical.com>
+  issues:
+    - https://github.com/canonical/airflow-provider-configurator/issues
+  source:
+    - https://github.com/canonical/airflow-provider-configurator
+
+# Documentation:
+# https://documentation.ubuntu.com/charmcraft/stable/howto/build-guides/select-platforms/
+base: ubuntu@26.04
+platforms:
+  amd64:
+
+assumes:
+  - juju >= 3.6
+
+parts:
+  charm:
+    plugin: uv
+    source: .
+    build-snaps:
+      - astral-uv
+  files:
+    plugin: dump
+    source: .
+    stage:
+      - LICENSE

@@ -1,0 +1,29 @@
+# Charm build artifacts
+*.charm
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Testing / tooling
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Virtual environments
+venv/
+.venv/
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
