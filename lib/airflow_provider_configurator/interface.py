@@ -6,7 +6,8 @@
 r"""Implementation of the `airflow_provider_configuration` relation interface.
 
 This module contains the data model shared over the relation, plus the provider
-and requirer handler classes.
+and requirer handler classes. It is implemented directly on top of `ops`, with no
+external charm-lib dependency.
 
 The provider (the airflow-provider-configurator charm) shares:
   * `provider_configuration`: a Jinja2 template string for the non-sensitive
@@ -54,9 +55,9 @@ class AirflowCoordinatorCharm(ops.CharmBase):
 
 import configparser
 import json
-import typing
+from dataclasses import dataclass
+from typing import Optional
 
-import charms.data_platform_libs.v1.data_interfaces as data_interfaces
 import ops
 
 DEFAULT_RELATION_NAME = "airflow-provider-configuration"
@@ -70,8 +71,13 @@ CHARM_PROVIDER_CONFIG_SECRET_LABEL = "provider-configuration-charm-secret"
 # map is therefore JSON-encoded and stored under this single valid key.
 SENSITIVE_DATA_SECRET_KEY = "sensitive-data"
 
+# Relation databag keys (hyphenated, per convention).
+DATABAG_KEY_CONFIGURATION = "provider-configuration"
+DATABAG_KEY_SECRET_ID = "provider-configuration-secret-id"
 
-class AirflowProviderConfiguratorProviderModel(data_interfaces.BaseCommonModel):
+
+@dataclass
+class AirflowProviderConfiguratorProviderModel:
     """Data shared over the airflow_provider_configuration relation (provider side).
 
     Attributes:
@@ -81,8 +87,8 @@ class AirflowProviderConfiguratorProviderModel(data_interfaces.BaseCommonModel):
             sensitive values that render `provider_configuration`.
     """
 
-    provider_configuration: typing.Optional[str] = None
-    provider_configuration_secret_id: typing.Optional[str] = None
+    provider_configuration: Optional[str] = None
+    provider_configuration_secret_id: Optional[str] = None
 
 
 class AirflowProviderConfigurationProvides(ops.Object):
@@ -101,11 +107,6 @@ class AirflowProviderConfigurationProvides(ops.Object):
         super().__init__(charm, relation_name)
         self._charm = charm
         self._relation_name = relation_name
-        self._interface = data_interfaces.OpsRelationRepositoryInterface(
-            self._charm.model,
-            relation_name,
-            AirflowProviderConfiguratorProviderModel,
-        )
 
     def _set_secret(
         self,
@@ -156,12 +157,10 @@ class AirflowProviderConfigurationProvides(ops.Object):
 
         secret = self._set_secret(provider_configuration_sensitive_data, relations)
 
-        model = AirflowProviderConfiguratorProviderModel(
-            provider_configuration=provider_configuration,
-            provider_configuration_secret_id=secret.id,
-        )
         for relation in relations:
-            self._interface.write_model(relation.id, model)
+            databag = relation.data[self._charm.app]
+            databag[DATABAG_KEY_CONFIGURATION] = provider_configuration
+            databag[DATABAG_KEY_SECRET_ID] = secret.id or ""
 
     def clear_configuration(self) -> None:
         """Remove published provider configuration from all relations.
@@ -174,9 +173,10 @@ class AirflowProviderConfigurationProvides(ops.Object):
         if not self._charm.unit.is_leader():
             return
 
-        empty = AirflowProviderConfiguratorProviderModel()
         for relation in self._charm.model.relations[self._relation_name]:
-            self._interface.write_model(relation.id, empty)
+            databag = relation.data[self._charm.app]
+            databag.pop(DATABAG_KEY_CONFIGURATION, None)
+            databag.pop(DATABAG_KEY_SECRET_ID, None)
 
         try:
             secret = self._charm.model.get_secret(label=CHARM_PROVIDER_CONFIG_SECRET_LABEL)
@@ -200,30 +200,26 @@ class AirflowProviderConfigurationRequires(ops.Object):
         super().__init__(charm, relation_name)
         self._charm = charm
         self._relation_name = relation_name
-        self._interface = data_interfaces.OpsRelationRepositoryInterface(
-            self._charm.model,
-            relation_name,
-            AirflowProviderConfiguratorProviderModel,
-        )
 
-    def _get_model(self) -> typing.Optional[AirflowProviderConfiguratorProviderModel]:
-        """Read and validate the provider model from the relation databag."""
+    def _get_model(self) -> Optional[AirflowProviderConfiguratorProviderModel]:
+        """Read the provider model from the relation databag."""
         relation = self._charm.model.get_relation(self._relation_name)
         if not relation or not relation.app:
             return None
-        try:
-            return self._interface.build_model(
-                relation.id,
-                AirflowProviderConfiguratorProviderModel,
-                component=relation.app,
-            )
-        except Exception:
+        databag = relation.data[relation.app]
+        configuration = databag.get(DATABAG_KEY_CONFIGURATION)
+        secret_id = databag.get(DATABAG_KEY_SECRET_ID)
+        if configuration is None and secret_id is None:
             return None
+        return AirflowProviderConfiguratorProviderModel(
+            provider_configuration=configuration,
+            provider_configuration_secret_id=secret_id,
+        )
 
-    def configurations(self) -> typing.Optional[str]:
+    def configurations(self) -> Optional[str]:
         """Return the non-sensitive provider configuration template.
 
-        Reads the `provider_configuration` field (a Jinja2 template string) from
+        Reads the `provider-configuration` field (a Jinja2 template string) from
         the relation databag. Returns None if there is no relation or no data yet.
         """
         model = self._get_model()
