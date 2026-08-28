@@ -1,0 +1,33 @@
+name: Promote charm
+
+on:
+  workflow_dispatch:
+    inputs:
+      origin-channel:
+        description: Origin channel
+        required: true
+        default: 1.0/edge
+      destination-channel:
+        description: Destination channel
+        required: true
+        default: 1.0/beta
+
+concurrency:
+  group: promote-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: Promote charm
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Promote charm
+        uses: canonical/charming-actions/promote-charm@2.7.0
+        with:
+          credentials: ${{ secrets.CHARMHUB_TOKEN }}
+          origin-channel: ${{ inputs.origin-channel }}
+          destination-channel: ${{ inputs.destination-channel }}
+          charmcraft-channel: 4.x/stable
