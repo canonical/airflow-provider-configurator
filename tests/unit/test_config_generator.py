@@ -76,7 +76,7 @@ class TestFullRoundTrip:
         assert "dapi-super-secret" not in published
 
         # The sensitive values live in the charm secret, JSON-encoded.
-        secret_id = out_relation.local_app_data["provider-configuration-secret-id"]
-        assert state_out.get_secret(id=secret_id).latest_content == {
+        secret_uri = out_relation.local_app_data["provider-configuration-secret-uri"]
+        assert state_out.get_secret(id=secret_uri).latest_content == {
             "sensitive-data": json.dumps(sensitive)
         }

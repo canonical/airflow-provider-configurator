@@ -13,7 +13,7 @@ The provider (the airflow-provider-configurator charm) shares:
   * `provider_configuration`: a Jinja2 template string for the non-sensitive
     provider configuration, with placeholders (e.g. `{{ gcs__conn_id }}`) where
     sensitive values belong.
-  * `provider_configuration_secret_id`: the URI of a charm secret holding the
+  * `provider_configuration_secret_uri`: the URI of a charm secret holding the
     sensitive values used to render the template.
 
 The requirer (the airflow-coordinator charm) reads the template, resolves the
@@ -22,12 +22,12 @@ secret to obtain the sensitive values, and merges the result into airflow.cfg.
 ### Provider Charm (airflow-provider-configurator)
 
 ```python
-from airflow_provider_configurator import AirflowProviderConfigurationProvides
+from airflow_provider_configurator import AirflowProviderConfiguratorProvides
 
 class AirflowProviderConfiguratorCharm(ops.CharmBase):
     def __init__(self, framework):
         super().__init__(framework)
-        self.provider = AirflowProviderConfigurationProvides(self)
+        self.provider = AirflowProviderConfiguratorProvides(self)
 
     def _reconcile(self, _):
         self.provider.set_configuration(
@@ -39,12 +39,12 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
 ### Requirer Charm (airflow-coordinator)
 
 ```python
-from airflow_provider_configurator import AirflowProviderConfigurationRequires
+from airflow_provider_configurator import AirflowProviderConfiguratorRequires
 
 class AirflowCoordinatorCharm(ops.CharmBase):
     def __init__(self, framework):
         super().__init__(framework)
-        self.provider_config = AirflowProviderConfigurationRequires(self)
+        self.provider_config = AirflowProviderConfiguratorRequires(self)
 
     def _on_relation_changed(self, event):
         template = self.provider_config.configurations()
@@ -72,7 +72,7 @@ SENSITIVE_DATA_SECRET_KEY = "sensitive-data"
 
 # Relation databag keys (hyphenated, per convention).
 DATABAG_KEY_CONFIGURATION = "provider-configuration"
-DATABAG_KEY_SECRET_ID = "provider-configuration-secret-id"
+DATABAG_KEY_SECRET_URI = "provider-configuration-secret-uri"
 
 
 @dataclass
@@ -82,15 +82,15 @@ class AirflowProviderConfiguratorProviderModel:
     Attributes:
         provider_configuration: a Jinja2 template string for the non-sensitive
             provider configuration, with placeholders for sensitive values.
-        provider_configuration_secret_id: the URI of the charm secret holding the
+        provider_configuration_secret_uri: the URI of the charm secret holding the
             sensitive values that render `provider_configuration`.
     """
 
     provider_configuration: str | None = None
-    provider_configuration_secret_id: str | None = None
+    provider_configuration_secret_uri: str | None = None
 
 
-class AirflowProviderConfigurationProvides(ops.Object):
+class AirflowProviderConfiguratorProvides(ops.Object):
     """Provider side of the airflow_provider_configuration relation.
 
     Used by the airflow-provider-configurator charm to publish validated provider
@@ -164,27 +164,10 @@ class AirflowProviderConfigurationProvides(ops.Object):
         for relation in relations:
             databag = relation.data[self._charm.app]
             databag[DATABAG_KEY_CONFIGURATION] = provider_configuration
-            databag[DATABAG_KEY_SECRET_ID] = secret.id
-
-    def clear_configuration(self) -> None:
-        """Remove published provider configuration from all relations.
-
-        Removes the configuration data from the relation databag. Useful when
-        validation fails, when there is no .ini to read after a new commit, or when
-        configuration should otherwise be withdrawn.
-
-        No-op if this unit is not the leader.
-        """
-        if not self._charm.unit.is_leader():
-            return
-
-        for relation in self._charm.model.relations[self._relation_name]:
-            databag = relation.data[self._charm.app]
-            databag.pop(DATABAG_KEY_CONFIGURATION, None)
-            databag.pop(DATABAG_KEY_SECRET_ID, None)
+            databag[DATABAG_KEY_SECRET_URI] = secret.id
 
 
-class AirflowProviderConfigurationRequires(ops.Object):
+class AirflowProviderConfiguratorRequires(ops.Object):
     """Requirer side of the airflow_provider_configuration relation.
 
     Used by the airflow-coordinator charm to read provider configuration shared by
@@ -207,12 +190,12 @@ class AirflowProviderConfigurationRequires(ops.Object):
             return None
         databag = relation.data[relation.app]
         configuration = databag.get(DATABAG_KEY_CONFIGURATION)
-        secret_id = databag.get(DATABAG_KEY_SECRET_ID)
-        if configuration is None and secret_id is None:
+        secret_uri = databag.get(DATABAG_KEY_SECRET_URI)
+        if configuration is None and secret_uri is None:
             return None
         return AirflowProviderConfiguratorProviderModel(
             provider_configuration=configuration,
-            provider_configuration_secret_id=secret_id,
+            provider_configuration_secret_uri=secret_uri,
         )
 
     def configurations(self) -> str | None:
@@ -227,13 +210,13 @@ class AirflowProviderConfigurationRequires(ops.Object):
     def get_sensitive_data(self) -> dict[str, str]:
         """Return the sensitive values held in the provider's charm secret.
 
-        Resolves `provider_configuration_secret_id` to the charm secret and reads
+        Resolves `provider_configuration_secret_uri` to the charm secret and reads
         its content, returning a mapping of placeholder name to value.
         """
         model = self._get_model()
-        if not model or not model.provider_configuration_secret_id:
+        if not model or not model.provider_configuration_secret_uri:
             return {}
-        secret = self._charm.model.get_secret(id=model.provider_configuration_secret_id)
+        secret = self._charm.model.get_secret(id=model.provider_configuration_secret_uri)
         content = secret.get_content(refresh=True)
         return json.loads(content[SENSITIVE_DATA_SECRET_KEY])
 

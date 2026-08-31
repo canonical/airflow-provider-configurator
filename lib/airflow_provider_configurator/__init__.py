@@ -11,13 +11,13 @@ airflow-coordinator charm (requirer).
 """
 
 from airflow_provider_configurator.interface import (
-    AirflowProviderConfigurationProvides,
-    AirflowProviderConfigurationRequires,
     AirflowProviderConfiguratorProviderModel,
+    AirflowProviderConfiguratorProvides,
+    AirflowProviderConfiguratorRequires,
 )
 
 __all__ = [
     "AirflowProviderConfiguratorProviderModel",
-    "AirflowProviderConfigurationProvides",
-    "AirflowProviderConfigurationRequires",
+    "AirflowProviderConfiguratorProvides",
+    "AirflowProviderConfiguratorRequires",
 ]

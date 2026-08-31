@@ -33,7 +33,7 @@ class ProviderHarnessCharm(ops.CharmBase):
 
     def __init__(self, *args):
         super().__init__(*args)
-        self.provider = apc.AirflowProviderConfigurationProvides(self, RELATION_NAME)
+        self.provider = apc.AirflowProviderConfiguratorProvides(self, RELATION_NAME)
 
 
 class RequirerHarnessCharm(ops.CharmBase):
@@ -41,7 +41,7 @@ class RequirerHarnessCharm(ops.CharmBase):
 
     def __init__(self, *args):
         super().__init__(*args)
-        self.requirer = apc.AirflowProviderConfigurationRequires(self, RELATION_NAME)
+        self.requirer = apc.AirflowProviderConfiguratorRequires(self, RELATION_NAME)
 
 
 @pytest.fixture

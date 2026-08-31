@@ -29,9 +29,9 @@ class TestProvides:
         out_relation = state_out.get_relation(relation.id)
         assert out_relation.local_app_data["provider-configuration"] == SAMPLE_TEMPLATE
 
-        secret_id = out_relation.local_app_data["provider-configuration-secret-id"]
-        assert secret_id
-        assert state_out.get_secret(id=secret_id).latest_content == {
+        secret_uri = out_relation.local_app_data["provider-configuration-secret-uri"]
+        assert secret_uri
+        assert state_out.get_secret(id=secret_uri).latest_content == {
             "sensitive-data": json.dumps(SAMPLE_SENSITIVE)
         }
 
@@ -86,30 +86,10 @@ class TestProvides:
 
         # The secret content is still correct after the no-op second publish.
         out_relation = state_out.get_relation(relation.id)
-        secret_id = out_relation.local_app_data["provider-configuration-secret-id"]
-        assert state_out.get_secret(id=secret_id).latest_content == {
+        secret_uri = out_relation.local_app_data["provider-configuration-secret-uri"]
+        assert state_out.get_secret(id=secret_uri).latest_content == {
             "sensitive-data": json.dumps(SAMPLE_SENSITIVE)
         }
-
-    def test_clear_configuration_clears_databag(self, provider_context, relation):
-        state = ops.testing.State(leader=True, relations=[relation])
-        with provider_context(provider_context.on.relation_changed(relation), state) as manager:
-            manager.charm.provider.set_configuration(
-                provider_configuration=SAMPLE_TEMPLATE,
-                provider_configuration_sensitive_data=SAMPLE_SENSITIVE,
-            )
-            manager.charm.provider.clear_configuration()
-            state_out = manager.run()
-
-        out_relation = state_out.get_relation(relation.id)
-        assert not out_relation.local_app_data.get("provider-configuration")
-
-    def test_clear_configuration_noop_when_not_leader(self, provider_context, relation):
-        state = ops.testing.State(leader=False, relations=[relation])
-        with provider_context(provider_context.on.relation_changed(relation), state) as manager:
-            # Should not raise even though this unit is not the leader.
-            manager.charm.provider.clear_configuration()
-            manager.run()
 
 
 class TestRequires:
@@ -117,7 +97,7 @@ class TestRequires:
         secret = ops.testing.Secret({"sensitive-data": json.dumps(SAMPLE_SENSITIVE)})
         remote_data = {
             "provider-configuration": SAMPLE_TEMPLATE,
-            "provider-configuration-secret-id": secret.id,
+            "provider-configuration-secret-uri": secret.id,
         }
         rel = ops.testing.Relation(
             RELATION_NAME,
@@ -156,7 +136,7 @@ class TestRequires:
             interface=RELATION_INTERFACE,
             remote_app_data={
                 "provider-configuration": template,
-                "provider-configuration-secret-id": secret.id,
+                "provider-configuration-secret-uri": secret.id,
             },
         )
         state = ops.testing.State(leader=True, relations=[rel], secrets=[secret])
