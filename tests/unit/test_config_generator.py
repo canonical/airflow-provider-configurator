@@ -5,15 +5,9 @@
 
 import json
 
-import airflow_provider_configurator as apc
-import ops
 import ops.testing
-import pytest
 
 from config_generator import build_template_and_secrets
-
-RELATION_NAME = "airflow-provider-configuration"
-RELATION_INTERFACE = "airflow_provider_configuration"
 
 # A realistic, multi-section provider INI (non-sensitive values only).
 SAMPLE_INI = """\
@@ -29,33 +23,6 @@ SAMPLE_SENSITIVE = {
     "databricks": {"token": "dapi-super-secret"},
     "aws": {"secret_access_key": "aws-super-secret"},
 }
-
-
-class ProviderHarnessCharm(ops.CharmBase):
-    """Mock charm wiring the provider side of the interface."""
-
-    def __init__(self, *args):
-        super().__init__(*args)
-        self.provider = apc.AirflowProviderConfigurationProvides(self, RELATION_NAME)
-
-
-class RequirerHarnessCharm(ops.CharmBase):
-    """Mock charm wiring the requirer side of the interface."""
-
-    def __init__(self, *args):
-        super().__init__(*args)
-        self.requirer = apc.AirflowProviderConfigurationRequires(self, RELATION_NAME)
-
-
-@pytest.fixture
-def provider_context():
-    return ops.testing.Context(
-        charm_type=ProviderHarnessCharm,
-        meta={
-            "name": "airflow-provider-configurator",
-            "provides": {RELATION_NAME: {"interface": RELATION_INTERFACE}},
-        },
-    )
 
 
 class TestConfigGenerator:
@@ -89,7 +56,9 @@ class TestFullRoundTrip:
         """Real INI -> config_generator -> set_configuration -> databag + secret."""
         template, sensitive = build_template_and_secrets(SAMPLE_INI, SAMPLE_SENSITIVE)
 
-        relation = ops.testing.Relation(RELATION_NAME, interface=RELATION_INTERFACE)
+        relation = ops.testing.Relation(
+            "airflow-provider-configuration", interface="airflow_provider_configuration"
+        )
         state = ops.testing.State(leader=True, relations=[relation])
 
         with provider_context(provider_context.on.relation_changed(relation), state) as manager:

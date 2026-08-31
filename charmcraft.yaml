@@ -30,6 +30,10 @@ platforms:
 assumes:
   - juju >= 3.6
 
+provides:
+  airflow-provider-configuration:
+    interface: airflow_provider_configuration
+
 parts:
   charm:
     plugin: uv

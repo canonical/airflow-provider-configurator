@@ -56,7 +56,6 @@ class AirflowCoordinatorCharm(ops.CharmBase):
 import configparser
 import json
 from dataclasses import dataclass
-from typing import Optional
 
 import ops
 
@@ -87,8 +86,8 @@ class AirflowProviderConfiguratorProviderModel:
             sensitive values that render `provider_configuration`.
     """
 
-    provider_configuration: Optional[str] = None
-    provider_configuration_secret_id: Optional[str] = None
+    provider_configuration: str | None = None
+    provider_configuration_secret_id: str | None = None
 
 
 class AirflowProviderConfigurationProvides(ops.Object):
@@ -121,7 +120,10 @@ class AirflowProviderConfigurationProvides(ops.Object):
         secret_content = {SENSITIVE_DATA_SECRET_KEY: json.dumps(content)}
         try:
             secret = self._charm.model.get_secret(label=CHARM_PROVIDER_CONFIG_SECRET_LABEL)
-            secret.set_content(secret_content)
+            # Only write a new revision if the content actually changed, otherwise a
+            # reconcile-driven charm would churn secret revisions on every hook.
+            if secret.get_content(refresh=True) != secret_content:
+                secret.set_content(secret_content)
         except ops.SecretNotFoundError:
             secret = self._charm.app.add_secret(
                 secret_content, label=CHARM_PROVIDER_CONFIG_SECRET_LABEL
@@ -156,17 +158,20 @@ class AirflowProviderConfigurationProvides(ops.Object):
             return
 
         secret = self._set_secret(provider_configuration_sensitive_data, relations)
+        if not secret.id:
+            raise RuntimeError("Charm secret has no id; cannot publish to the databag.")
 
         for relation in relations:
             databag = relation.data[self._charm.app]
             databag[DATABAG_KEY_CONFIGURATION] = provider_configuration
-            databag[DATABAG_KEY_SECRET_ID] = secret.id or ""
+            databag[DATABAG_KEY_SECRET_ID] = secret.id
 
     def clear_configuration(self) -> None:
         """Remove published provider configuration from all relations.
 
-        Useful when validation fails, when there is no .ini to read after a new
-        commit, or when configuration should otherwise be withdrawn.
+        Removes the configuration data from the relation databag. Useful when
+        validation fails, when there is no .ini to read after a new commit, or when
+        configuration should otherwise be withdrawn.
 
         No-op if this unit is not the leader.
         """
@@ -177,12 +182,6 @@ class AirflowProviderConfigurationProvides(ops.Object):
             databag = relation.data[self._charm.app]
             databag.pop(DATABAG_KEY_CONFIGURATION, None)
             databag.pop(DATABAG_KEY_SECRET_ID, None)
-
-        try:
-            secret = self._charm.model.get_secret(label=CHARM_PROVIDER_CONFIG_SECRET_LABEL)
-            secret.remove_all_revisions()
-        except ops.SecretNotFoundError:
-            pass
 
 
 class AirflowProviderConfigurationRequires(ops.Object):
@@ -201,7 +200,7 @@ class AirflowProviderConfigurationRequires(ops.Object):
         self._charm = charm
         self._relation_name = relation_name
 
-    def _get_model(self) -> Optional[AirflowProviderConfiguratorProviderModel]:
+    def _get_model(self) -> AirflowProviderConfiguratorProviderModel | None:
         """Read the provider model from the relation databag."""
         relation = self._charm.model.get_relation(self._relation_name)
         if not relation or not relation.app:
@@ -216,7 +215,7 @@ class AirflowProviderConfigurationRequires(ops.Object):
             provider_configuration_secret_id=secret_id,
         )
 
-    def configurations(self) -> Optional[str]:
+    def configurations(self) -> str | None:
         """Return the non-sensitive provider configuration template.
 
         Reads the `provider-configuration` field (a Jinja2 template string) from
@@ -247,7 +246,11 @@ class AirflowProviderConfigurationRequires(ops.Object):
         model = self._get_model()
         if not model or not model.provider_configuration:
             return set()
-        parser = configparser.ConfigParser()
+        # Match the generator's parser exactly (RawConfigParser + case-preserving
+        # optionxform): the default ConfigParser lowercases options and applies %
+        # interpolation, which would both corrupt collision detection.
+        parser = configparser.RawConfigParser()
+        parser.optionxform = str  # type: ignore[assignment, method-assign]
         parser.read_string(model.provider_configuration)
         return {
             f"{section}.{option}"
