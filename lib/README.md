@@ -18,13 +18,13 @@ repository, under `lib/`.
 Provider (airflow-provider-configurator):
 
 ```python
-from airflow_provider_configurator import AirflowProviderConfigurationProvides
+from airflow_provider_configurator import AirflowProviderConfiguratorProvides
 ```
 
 Requirer (airflow-coordinator):
 
 ```python
-from airflow_provider_configurator import AirflowProviderConfigurationRequires
+from airflow_provider_configurator import AirflowProviderConfiguratorRequires
 ```
 
 See `airflow_provider_configurator/interface.py` for the full API.
