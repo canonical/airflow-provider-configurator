@@ -11,6 +11,7 @@ requires-python = ">=3.12"
 # any charmlibs that the charm uses (copy the dependencies from their PYDEPS).
 dependencies = [
     "ops>=3,<4",
+    "pydantic>=2",
     "airflow-provider-configurator-charmlib",
 ]
 
