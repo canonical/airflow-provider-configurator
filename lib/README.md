@@ -6,8 +6,9 @@ Common charm library for the provider and requirer sides of the
 This interface connects the `airflow-provider-configurator` charm (provider) to
 the `airflow-coordinator` charm (requirer). The provider shares a non-sensitive
 Jinja2 configuration template together with a reference to a charm secret holding
-the sensitive values; the requirer reads the template, resolves the secret, and
-merges the result into `airflow.cfg`.
+the sensitive values. The actual render into `airflow.cfg` happens later, once,
+in whichever charm (a core charm, or the coordinator itself for its own
+DB-migration copy) writes the file.
 
 The source for this package lives inside the
 [`airflow-provider-configurator`](https://github.com/canonical/airflow-provider-configurator)

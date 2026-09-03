@@ -6,8 +6,10 @@
 import json
 from unittest.mock import patch
 
+import airflow_provider_configurator as apc
 import ops
 import ops.testing
+import pytest
 
 RELATION_NAME = "airflow-provider-configuration"
 RELATION_INTERFACE = "airflow_provider_configuration"
@@ -152,3 +154,21 @@ class TestRequires:
             assert manager.charm.requirer.configurations() is None
             assert manager.charm.requirer.get_sensitive_data() == {}
             assert manager.charm.requirer.configuration_keys() == set()
+
+    def test_get_sensitive_data_raises_when_secret_not_granted(self, requirer_context):
+        """If the provider's secret isn't accessible, raise SecretNotReadyError."""
+        # Databag references a secret id that is NOT present in the State's secrets,
+        # simulating a secret that hasn't been granted to this charm yet.
+        rel = ops.testing.Relation(
+            RELATION_NAME,
+            interface=RELATION_INTERFACE,
+            remote_app_data={
+                "provider-configuration": SAMPLE_TEMPLATE,
+                "provider-configuration-secret-uri": "secret:nonexistent0000000000",
+            },
+        )
+        state = ops.testing.State(leader=True, relations=[rel])
+        with requirer_context(requirer_context.on.relation_changed(rel), state) as manager:
+            manager.run()
+            with pytest.raises(apc.SecretNotReadyError, match="not.*granted"):
+                manager.charm.requirer.get_sensitive_data()

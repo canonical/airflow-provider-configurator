@@ -16,8 +16,10 @@ The provider (the airflow-provider-configurator charm) shares:
   * `provider_configuration_secret_uri`: the URI of a charm secret holding the
     sensitive values used to render the template.
 
-The requirer (the airflow-coordinator charm) reads the template, resolves the
-secret to obtain the sensitive values, and merges the result into airflow.cfg.
+The requirer (the airflow-coordinator charm) reads the template and resolves the
+secret to obtain the sensitive values. The actual render into airflow.cfg happens
+later, once, in whichever charm (a core charm, or the coordinator itself for its
+own DB-migration copy) writes the file.
 
 ### Provider Charm (airflow-provider-configurator)
 
@@ -75,6 +77,15 @@ DATABAG_KEY_CONFIGURATION = "provider-configuration"
 DATABAG_KEY_SECRET_URI = "provider-configuration-secret-uri"
 
 
+class SecretNotReadyError(Exception):
+    """Raised when the provider's charm secret is not accessible yet.
+
+    Typically because the secret has not been granted to this charm, or the grant
+    has not propagated. The charm should catch this and set a blocked status
+    rather than letting an unhandled exception surface.
+    """
+
+
 @dataclass
 class AirflowProviderConfiguratorProviderModel:
     """Data shared over the airflow_provider_configuration relation (provider side).
@@ -107,30 +118,52 @@ class AirflowProviderConfiguratorProvides(ops.Object):
         self._charm = charm
         self._relation_name = relation_name
 
-    def _set_secret(
-        self,
-        content: dict[str, str],
-        relations: list[ops.Relation],
-    ) -> ops.Secret:
-        """Create or update the charm secret holding the sensitive data.
+    def _get_or_create_secret(self, content: dict[str, str]) -> ops.Secret:
+        """Return the charm secret holding the sensitive data, creating it if needed.
 
-        Grants the secret to every related application. Returns the Secret so the
-        caller can read its id for the databag.
+        Args:
+            content: a FLAT mapping of Jinja2 placeholder name (e.g. "gcs__conn_id",
+                matching a ``{{ gcs__conn_id }}`` in the template) to its sensitive
+                value. Used to seed the secret if it does not yet exist. Stored
+                JSON-encoded under a single Juju-valid secret key.
+
+        Returns:
+            The existing or newly created charm secret.
         """
-        secret_content = {SENSITIVE_DATA_SECRET_KEY: json.dumps(content)}
         try:
-            secret = self._charm.model.get_secret(label=CHARM_PROVIDER_CONFIG_SECRET_LABEL)
-            # Only write a new revision if the content actually changed, otherwise a
-            # reconcile-driven charm would churn secret revisions on every hook.
-            if secret.get_content(refresh=True) != secret_content:
-                secret.set_content(secret_content)
+            return self._charm.model.get_secret(label=CHARM_PROVIDER_CONFIG_SECRET_LABEL)
         except ops.SecretNotFoundError:
-            secret = self._charm.app.add_secret(
+            secret_content = {SENSITIVE_DATA_SECRET_KEY: json.dumps(content)}
+            return self._charm.app.add_secret(
                 secret_content, label=CHARM_PROVIDER_CONFIG_SECRET_LABEL
             )
+
+    def _set_secret(
+        self,
+        secret: ops.Secret,
+        content: dict[str, str],
+        relations: list[ops.Relation],
+    ) -> None:
+        """Update the charm secret's content if it changed, and grant it.
+
+        Args:
+            secret: the charm secret to update and grant. Resolved by the caller
+                so it owns the reference used to publish the secret id.
+            content: a FLAT mapping of Jinja2 placeholder name (e.g. "gcs__conn_id",
+                matching a ``{{ gcs__conn_id }}`` in the template) to its sensitive
+                value. Stored JSON-encoded under a single Juju-valid secret key.
+            relations: the relations whose applications the secret is granted to.
+        """
+        # Only write a new revision when the sensitive data actually changed,
+        # otherwise a reconcile-driven charm would churn secret revisions on
+        # every hook. Compare decoded dicts, not the JSON-encoded strings, to
+        # avoid false diffs from key ordering.
+        current = secret.get_content(refresh=True).get(SENSITIVE_DATA_SECRET_KEY)
+        current_content = json.loads(current) if current else None
+        if current_content != content:
+            secret.set_content({SENSITIVE_DATA_SECRET_KEY: json.dumps(content)})
         for relation in relations:
             secret.grant(relation)
-        return secret
 
     def set_configuration(
         self,
@@ -148,8 +181,8 @@ class AirflowProviderConfiguratorProvides(ops.Object):
         Args:
             provider_configuration: Jinja2 template string with placeholders for
                 sensitive values.
-            provider_configuration_sensitive_data: mapping of placeholder name to
-                sensitive value, stored in a charm secret.
+            provider_configuration_sensitive_data: a FLAT mapping of placeholder
+                name to sensitive value, stored in the charm secret.
         """
         if not self._charm.unit.is_leader():
             return
@@ -157,9 +190,12 @@ class AirflowProviderConfiguratorProvides(ops.Object):
         if not relations:
             return
 
-        secret = self._set_secret(provider_configuration_sensitive_data, relations)
+        # Resolve the charm secret once here so this method owns the reference,
+        # then thread it through _set_secret (which only updates and grants it).
+        secret = self._get_or_create_secret(provider_configuration_sensitive_data)
+        self._set_secret(secret, provider_configuration_sensitive_data, relations)
         if not secret.id:
-            raise RuntimeError("Charm secret has no id; cannot publish to the databag.")
+            raise RuntimeError("Charm secret is missing an id; cannot publish to the databag.")
 
         for relation in relations:
             databag = relation.data[self._charm.app]
@@ -212,12 +248,23 @@ class AirflowProviderConfiguratorRequires(ops.Object):
 
         Resolves `provider_configuration_secret_uri` to the charm secret and reads
         its content, returning a mapping of placeholder name to value.
+
+        Raises:
+            SecretNotReadyError: if the secret is not accessible yet, e.g. it has
+                not been granted to this charm. Callers should catch this and set
+                a blocked status.
         """
         model = self._get_model()
         if not model or not model.provider_configuration_secret_uri:
             return {}
-        secret = self._charm.model.get_secret(id=model.provider_configuration_secret_uri)
-        content = secret.get_content(refresh=True)
+        try:
+            secret = self._charm.model.get_secret(id=model.provider_configuration_secret_uri)
+            content = secret.get_content(refresh=True)
+        except ops.SecretNotFoundError as e:
+            raise SecretNotReadyError(
+                "Provider configuration secret is not accessible; "
+                "it may not be granted to this charm yet."
+            ) from e
         return json.loads(content[SENSITIVE_DATA_SECRET_KEY])
 
     def configuration_keys(self) -> set[str]:

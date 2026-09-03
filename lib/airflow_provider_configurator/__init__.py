@@ -14,10 +14,12 @@ from airflow_provider_configurator.interface import (
     AirflowProviderConfiguratorProviderModel,
     AirflowProviderConfiguratorProvides,
     AirflowProviderConfiguratorRequires,
+    SecretNotReadyError,
 )
 
 __all__ = [
     "AirflowProviderConfiguratorProviderModel",
     "AirflowProviderConfiguratorProvides",
     "AirflowProviderConfiguratorRequires",
+    "SecretNotReadyError",
 ]
