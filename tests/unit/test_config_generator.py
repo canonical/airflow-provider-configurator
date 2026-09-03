@@ -34,15 +34,15 @@ class TestConfigGenerator:
         assert "region = us-east-1" in template
 
         # Sensitive values become namespaced placeholders, not literals.
-        assert "{{ databricks__token }}" in template
-        assert "{{ aws__secret_access_key }}" in template
+        assert "{{ provider__databricks__token }}" in template
+        assert "{{ provider__aws__secret_access_key }}" in template
         assert "dapi-super-secret" not in template
         assert "aws-super-secret" not in template
 
         # The flat sensitive map is keyed by placeholder name.
         assert sensitive == {
-            "databricks__token": "dapi-super-secret",
-            "aws__secret_access_key": "aws-super-secret",
+            "provider__databricks__token": "dapi-super-secret",
+            "provider__aws__secret_access_key": "aws-super-secret",
         }
 
     def test_no_sensitive_data(self):
@@ -72,7 +72,7 @@ class TestFullRoundTrip:
 
         # The template (with placeholders) is on the databag; secrets are not.
         published = out_relation.local_app_data["provider-configuration"]
-        assert "{{ databricks__token }}" in published
+        assert "{{ provider__databricks__token }}" in published
         assert "dapi-super-secret" not in published
 
         # The sensitive values live in the charm secret, JSON-encoded.

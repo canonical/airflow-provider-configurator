@@ -11,8 +11,8 @@ external charm-lib dependency.
 
 The provider (the airflow-provider-configurator charm) shares:
   * `provider_configuration`: a Jinja2 template string for the non-sensitive
-    provider configuration, with placeholders (e.g. `{{ gcs__conn_id }}`) where
-    sensitive values belong.
+    provider configuration, with placeholders (e.g. `{{ provider__gcs__conn_id }}`)
+    where sensitive values belong.
   * `provider_configuration_secret_uri`: the URI of a charm secret holding the
     sensitive values used to render the template.
 
@@ -33,8 +33,8 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
 
     def _reconcile(self, _):
         self.provider.set_configuration(
-            provider_configuration="[gcs]\nconn_id = {{ gcs__conn_id }}\n",
-            provider_configuration_sensitive_data={"gcs__conn_id": "secret-value"},
+            provider_configuration="[gcs]\nconn_id = {{ provider__gcs__conn_id }}\n",
+            provider_configuration_sensitive_data={"provider__gcs__conn_id": "secret-value"},
         )
 ```
 
@@ -68,8 +68,8 @@ DEFAULT_RELATION_NAME = "airflow-provider-configuration"
 CHARM_PROVIDER_CONFIG_SECRET_LABEL = "provider-configuration-charm-secret"
 
 # Juju secret keys must be lowercase alphanumeric and cannot contain the
-# double-underscore placeholder names (e.g. "gcs__conn_id"). The sensitive data
-# map is therefore JSON-encoded and stored under this single valid key.
+# double-underscore placeholder names (e.g. "provider__gcs__conn_id"). The
+# sensitive data map is therefore JSON-encoded and stored under this single valid key.
 SENSITIVE_DATA_SECRET_KEY = "sensitive-data"
 
 # Relation databag keys (hyphenated, per convention).
@@ -122,10 +122,11 @@ class AirflowProviderConfiguratorProvides(ops.Object):
         """Return the charm secret holding the sensitive data, creating it if needed.
 
         Args:
-            content: a FLAT mapping of Jinja2 placeholder name (e.g. "gcs__conn_id",
-                matching a ``{{ gcs__conn_id }}`` in the template) to its sensitive
-                value. Used to seed the secret if it does not yet exist. Stored
-                JSON-encoded under a single Juju-valid secret key.
+            content: a FLAT mapping of Jinja2 placeholder name (e.g.
+                "provider__gcs__conn_id", matching a ``{{ provider__gcs__conn_id }}``
+                in the template) to its sensitive value. Used to seed the secret if
+                it does not yet exist. Stored JSON-encoded under a single
+                Juju-valid secret key.
 
         Returns:
             The existing or newly created charm secret.
@@ -149,9 +150,10 @@ class AirflowProviderConfiguratorProvides(ops.Object):
         Args:
             secret: the charm secret to update and grant. Resolved by the caller
                 so it owns the reference used to publish the secret id.
-            content: a FLAT mapping of Jinja2 placeholder name (e.g. "gcs__conn_id",
-                matching a ``{{ gcs__conn_id }}`` in the template) to its sensitive
-                value. Stored JSON-encoded under a single Juju-valid secret key.
+            content: a FLAT mapping of Jinja2 placeholder name (e.g.
+                "provider__gcs__conn_id", matching a ``{{ provider__gcs__conn_id }}``
+                in the template) to its sensitive value. Stored JSON-encoded under
+                a single Juju-valid secret key.
             relations: the relations whose applications the secret is granted to.
         """
         # Only write a new revision when the sensitive data actually changed,

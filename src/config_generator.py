@@ -8,8 +8,8 @@ Implements the transformation described in spec section 1.5: given a provider
 configuration INI file (non-sensitive) and a map of sensitive values, produce:
 
   * a Jinja2 template string where each sensitive value is replaced by a
-    `{{ section__option }}` placeholder, and
-  * a flat sensitive-data map of `section__option` -> value
+    `{{ provider__section__option }}` placeholder, and
+  * a flat sensitive-data map of `provider__section__option` -> value
 
 The airflow-coordinator later renders the template using the sensitive map.
 
@@ -24,9 +24,11 @@ import io
 def _placeholder_name(section: str, option: str) -> str:
     """Return the namespaced placeholder name for a section.option pair.
 
-    For example, section "gcs" and option "conn_id" yields "gcs__conn_id".
+    For example, section "gcs" and option "conn_id" yields "provider__gcs__conn_id".
+    The `provider__` prefix namespaces these keys so they cannot collide with the
+    coordinator's own sensitive secret keys when the maps are merged later.
     """
-    return f"{section}__{option}"
+    return f"provider__{section}__{option}"
 
 
 def build_template_and_secrets(
@@ -40,12 +42,12 @@ def build_template_and_secrets(
             configuration (each value is used literally in the template).
         sensitive_data: a nested map of section -> option -> value for sensitive
             values. Each such value is written into the template as a
-            `{{ section__option }}` placeholder rather than its literal value,
-            and returned in the flat sensitive map.
+            `{{ provider__section__option }}` placeholder rather than its literal
+            value, and returned in the flat sensitive map.
 
     Returns:
         A tuple of (jinja_template_string, flat_sensitive_map) where the flat map
-        is keyed by placeholder name (e.g. "gcs__conn_id").
+        is keyed by placeholder name (e.g. "provider__gcs__conn_id").
     """
     sensitive_data = sensitive_data or {}
 

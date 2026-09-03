@@ -14,8 +14,8 @@ import pytest
 RELATION_NAME = "airflow-provider-configuration"
 RELATION_INTERFACE = "airflow_provider_configuration"
 
-SAMPLE_TEMPLATE = "[gcs]\nconn_id = {{ gcs__conn_id }}\n"
-SAMPLE_SENSITIVE = {"gcs__conn_id": "s3cret"}
+SAMPLE_TEMPLATE = "[gcs]\nconn_id = {{ provider__gcs__conn_id }}\n"
+SAMPLE_SENSITIVE = {"provider__gcs__conn_id": "s3cret"}
 
 
 class TestProvides:
