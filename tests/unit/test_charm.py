@@ -3,6 +3,8 @@
 
 """Tests for the Airflow Provider Configurator charm (git input path)."""
 
+import json
+
 import charms.git_integrator.v0.git as git
 import ops
 import ops.testing
@@ -13,6 +15,9 @@ from charm import AirflowProviderConfiguratorCharm
 GIT_RELATION = "remote-airflow-provider-configurations"
 PROVIDER_RELATION = "airflow-provider-configuration"
 FILE_PATH_CONFIG = "airflow_provider_configurations_file_path"
+
+SENSITIVE_SECRET_CONFIG = "airflow_provider_configurations_secret"
+SENSITIVE_CONFIG_KEY = "airflow_provider_configurations"
 
 # The secret content key git-integrator uses for the PAT.
 PAT_SECRET_KEY = "credentials-personal-access-token"
@@ -228,3 +233,99 @@ class TestSyncNowAction:
         )
         with pytest.raises(ops.testing.ActionFailed):
             context.run(context.on.action("sync-now"), state)
+
+
+class TestSensitiveData:
+    def test_sensitive_data_published_from_user_secret(self, context, synced_container):
+        """A valid user secret -> its sensitive values are published."""
+        user_secret = ops.testing.Secret(
+            {
+                SENSITIVE_CONFIG_KEY: json.dumps(
+                    {"databricks": {"databricks": {"token": "dapi-xxx"}}}
+                )
+            }
+        )
+        git_relation = _public_relation()
+        provider_relation = _provider_relation()
+        state = ops.testing.State(
+            leader=True,
+            containers=[synced_container],
+            relations=[git_relation, provider_relation],
+            secrets=[user_secret],
+            config={
+                FILE_PATH_CONFIG: "providers.ini",
+                SENSITIVE_SECRET_CONFIG: user_secret.id,
+            },
+        )
+        state_out = context.run(context.on.relation_changed(git_relation), state)
+        assert state_out.unit_status == ops.ActiveStatus()
+
+        # The published charm secret carries the flattened sensitive value.
+        out_provider = state_out.get_relation(provider_relation.id)
+        charm_secret_uri = out_provider.local_app_data["provider-configuration-secret-uri"]
+        content = state_out.get_secret(id=charm_secret_uri).latest_content
+        assert json.loads(content["sensitive-data"]) == {"provider__databricks__token": "dapi-xxx"}
+
+    def test_blocked_on_duplicate_sensitive_key(self, context, synced_container):
+        """Two providers setting the same section.option -> BlockedStatus (spec 3.3)."""
+        user_secret = ops.testing.Secret(
+            {
+                SENSITIVE_CONFIG_KEY: json.dumps(
+                    {
+                        "provider_a": {"core": {"fernet_key": "key-a"}},
+                        "provider_b": {"core": {"fernet_key": "key-b"}},
+                    }
+                )
+            }
+        )
+        git_relation = _public_relation()
+        state = ops.testing.State(
+            leader=True,
+            containers=[synced_container],
+            relations=[git_relation, _provider_relation()],
+            secrets=[user_secret],
+            config={
+                FILE_PATH_CONFIG: "providers.ini",
+                SENSITIVE_SECRET_CONFIG: user_secret.id,
+            },
+        )
+        state_out = context.run(context.on.relation_changed(git_relation), state)
+        assert isinstance(state_out.unit_status, ops.BlockedStatus)
+
+    def test_blocked_when_sensitive_secret_not_accessible(self, context, synced_container):
+        """Secret config set but the secret isn't granted/in the model -> BlockedStatus."""
+        # Build a real secret to get a validly-formatted id, but do NOT add it to
+        # State.secrets, so the charm cannot resolve it (simulates not-granted).
+        ungranted = ops.testing.Secret({SENSITIVE_CONFIG_KEY: json.dumps({})})
+        git_relation = _public_relation()
+        state = ops.testing.State(
+            leader=True,
+            containers=[synced_container],
+            relations=[git_relation, _provider_relation()],
+            config={
+                FILE_PATH_CONFIG: "providers.ini",
+                SENSITIVE_SECRET_CONFIG: ungranted.id,
+            },
+            # note: ungranted is intentionally NOT in secrets=[...]
+        )
+        state_out = context.run(context.on.relation_changed(git_relation), state)
+        assert isinstance(state_out.unit_status, ops.BlockedStatus)
+
+    def test_no_sensitive_secret_publishes_non_sensitive_only(self, context, synced_container):
+        """No sensitive secret config -> publishes non-sensitive config, stays Active."""
+        git_relation = _public_relation()
+        provider_relation = _provider_relation()
+        state = ops.testing.State(
+            leader=True,
+            containers=[synced_container],
+            relations=[git_relation, provider_relation],
+            config={FILE_PATH_CONFIG: "providers.ini"},  # no secret config
+        )
+        state_out = context.run(context.on.relation_changed(git_relation), state)
+        assert state_out.unit_status == ops.ActiveStatus()
+
+        out_provider = state_out.get_relation(provider_relation.id)
+        # The charm secret holds an empty sensitive map.
+        charm_secret_uri = out_provider.local_app_data["provider-configuration-secret-uri"]
+        content = state_out.get_secret(id=charm_secret_uri).latest_content
+        assert json.loads(content["sensitive-data"]) == {}

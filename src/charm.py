@@ -7,15 +7,18 @@
 This charm lets Charmed Airflow operators configure Airflow providers without
 manually editing airflow.cfg. Non-sensitive provider configuration is synced from
 a git repository (via the git-integrator charm) into a workload container running
-git-sync; validated configuration is relayed to the Airflow Coordinator charm over
-the `airflow_provider_configuration` relation.
+git-sync; sensitive configuration is supplied via a Juju user secret. Validated
+configuration is relayed to the Airflow Coordinator charm over the
+`airflow_provider_configuration` relation.
 
 git-sync runs continuously on its `--period` timer. On each successful sync whose
 content changed, it runs an `--exechook-command` script that calls `pebble notify`,
 which Juju surfaces as a Pebble custom-notice event. The charm observes that event,
-reads the synced .ini, and publishes the configuration.
+reads the synced .ini, combines it with sensitive data from the user secret, and
+publishes the configuration.
 """
 
+import json
 import logging
 
 import charms.git_integrator.v0.git as git
@@ -23,6 +26,7 @@ import ops
 from airflow_provider_configurator import AirflowProviderConfiguratorProvides
 
 import config_generator
+import sensitive_config
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +40,7 @@ CONTENT_SYNCED_NOTICE_KEY = "canonical.com/airflow-provider-configurator/content
 
 CONFIG_FILE_PATH = "airflow_provider_configurations_file_path"
 CONFIG_SYNC_PERIOD = "airflow_provider_configurations_sync_period"
+CONFIG_SENSITIVE_SECRET = "airflow_provider_configurations_secret"
 
 
 class ExceptionWithStatusError(Exception):
@@ -70,6 +75,7 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
             self.on.config_changed,
             self.on.update_status,
             self.on.upgrade_charm,
+            self.on.secret_changed,
             self.on[WORKLOAD_CONTAINER].pebble_ready,
             self.on[WORKLOAD_CONTAINER].pebble_custom_notice,
             self.on[GIT_RELATION_NAME].relation_changed,
@@ -105,6 +111,41 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
             if info:
                 return info
         return None
+
+    def _sensitive_data(self) -> dict[str, dict[str, str]]:
+        """Return the flattened sensitive provider config from the user secret.
+
+        The sensitive secret is optional: if the config option is unset, there is
+        no sensitive data and an empty map is returned. If the option is set but
+        the secret is unreadable (not granted, missing), its payload is invalid,
+        or two providers collide on the same section.option, the unit blocks.
+
+        Raises:
+            ExceptionWithStatusError: if the secret is set but cannot be read or
+                parsed, or if a duplicate section.option is found (spec 3.3).
+        """
+        secret_id = self.config.get(CONFIG_SENSITIVE_SECRET)
+        if not secret_id:
+            return {}
+        try:
+            secret = self.model.get_secret(id=str(secret_id))
+            content = secret.get_content(refresh=True)
+        except (ops.SecretNotFoundError, ops.ModelError) as e:
+            raise ExceptionWithStatusError(
+                "Sensitive configuration secret is not accessible; "
+                "check it exists and is granted to this charm.",
+                ops.BlockedStatus,
+            ) from e
+        raw_json = content.get(sensitive_config.SENSITIVE_CONFIG_SECRET_KEY, "")
+        try:
+            return sensitive_config.parse_sensitive_config(raw_json)
+        except sensitive_config.DuplicateSensitiveKeyError as e:
+            raise ExceptionWithStatusError(str(e), ops.BlockedStatus) from e
+        except json.JSONDecodeError as e:
+            raise ExceptionWithStatusError(
+                "Sensitive configuration secret payload is not valid JSON.",
+                ops.BlockedStatus,
+            ) from e
 
     # ---- reconcile --------------------------------------------------------
 
@@ -162,21 +203,22 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
     def _publish_configuration(self) -> None:
         """Read the synced .ini and publish it over the relation.
 
-        Reads the configured file from the synced content, converts it to a
-        template + sensitive map, and publishes via the provider interface.
-        Sensitive data from the user secret is wired in later work; for now the
-        .ini is non-sensitive only.
+        Combines the non-sensitive .ini (synced from git) with the sensitive
+        values (from the user secret) into a template + sensitive map, and
+        publishes via the provider interface.
 
         Raises:
-            ExceptionWithStatusError: if the configured file cannot be found.
+            ExceptionWithStatusError: if the file is missing, or the sensitive
+                secret is set but unreadable / invalid / has a collision.
         """
         ini_content = self._read_synced_file()
-        template, sensitive_data = config_generator.build_template_and_secrets(
-            ini_content, sensitive_data=None
+        sensitive_data = self._sensitive_data()
+        template, flat_sensitive = config_generator.build_template_and_secrets(
+            ini_content, sensitive_data=sensitive_data
         )
         self._config_provider.set_configuration(
             provider_configuration=template,
-            provider_configuration_sensitive_data=sensitive_data,
+            provider_configuration_sensitive_data=flat_sensitive,
         )
 
     def _read_synced_file(self) -> str:
