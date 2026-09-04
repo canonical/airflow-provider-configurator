@@ -11,10 +11,19 @@ import pytest
 from charm import AirflowProviderConfiguratorCharm
 
 GIT_RELATION = "remote-airflow-provider-configurations"
+PROVIDER_RELATION = "airflow-provider-configuration"
 FILE_PATH_CONFIG = "airflow_provider_configurations_file_path"
 
 # The secret content key git-integrator uses for the PAT.
 PAT_SECRET_KEY = "credentials-personal-access-token"
+
+SAMPLE_INI = """\
+[gcs]
+conn_id = default_gcp
+
+[logging]
+remote_logging = True
+"""
 
 
 @pytest.fixture
@@ -24,7 +33,25 @@ def context():
 
 @pytest.fixture
 def container():
+    """A reachable git-sync container with no synced content."""
     return ops.testing.Container(name="git-sync", can_connect=True)
+
+
+@pytest.fixture
+def synced_container(tmp_path):
+    """A git-sync container with a synced provider .ini mounted at /git/repo.
+
+    Mirrors what git-sync would have checked out: the file lives at
+    /git/repo/<file_path> inside the container.
+    """
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    (repo_dir / "providers.ini").write_text(SAMPLE_INI)
+    return ops.testing.Container(
+        name="git-sync",
+        can_connect=True,
+        mounts={"content": ops.testing.Mount(location="/git/repo", source=repo_dir)},
+    )
 
 
 @pytest.fixture
@@ -71,6 +98,11 @@ def _ssh_relation():
     )
 
 
+def _provider_relation():
+    """The provides relation to a coordinator, so publishing has a target."""
+    return ops.testing.Relation(PROVIDER_RELATION, interface="airflow_provider_configuration")
+
+
 class TestReconcile:
     def test_blocked_without_file_path(self, context, container):
         """No file_path config -> BlockedStatus."""
@@ -102,31 +134,51 @@ class TestReconcile:
         state_out = context.run(context.on.relation_changed(relation), state)
         assert isinstance(state_out.unit_status, ops.WaitingStatus)
 
-    def test_active_and_layer_applied(self, context, container):
-        """All prerequisites met -> ActiveStatus and git-sync layer present."""
+    def test_blocked_when_file_missing(self, context, container):
+        """Container ready but the configured file isn't synced -> BlockedStatus."""
         relation = _public_relation()
         state = ops.testing.State(
             leader=True,
-            containers=[container],
+            containers=[container],  # no mounted file
             relations=[relation],
             config={FILE_PATH_CONFIG: "providers.ini"},
         )
         state_out = context.run(context.on.relation_changed(relation), state)
+        assert isinstance(state_out.unit_status, ops.BlockedStatus)
+        assert "not found" in state_out.unit_status.message
+
+    def test_active_layer_applied_and_config_published(self, context, synced_container):
+        """All prerequisites met + file synced -> Active, layer set, config published."""
+        git_relation = _public_relation()
+        provider_relation = _provider_relation()
+        state = ops.testing.State(
+            leader=True,
+            containers=[synced_container],
+            relations=[git_relation, provider_relation],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        state_out = context.run(context.on.relation_changed(git_relation), state)
         assert state_out.unit_status == ops.ActiveStatus()
 
+        # git-sync layer is configured with the exechook.
         out_container = state_out.get_container("git-sync")
         command = out_container.layers["git-sync"].services["git-sync"].command
         assert "--repo=https://github.com/example/provider-config" in command
-        assert "--period=" in command
-        assert "--ref=main" in command
+        assert "--exechook-command=" in command
 
-    def test_https_auth_sets_username_and_password_env(self, context, container, pat_secret):
+        # The synced config was published to the provider relation.
+        out_provider = state_out.get_relation(provider_relation.id)
+        assert "provider-configuration" in out_provider.local_app_data
+
+    def test_https_auth_sets_username_and_password_env(
+        self, context, synced_container, pat_secret
+    ):
         """HTTPS credentials -> username on CLI, token in GITSYNC_PASSWORD env."""
         relation = _credentials_relation(pat_secret)
         state = ops.testing.State(
             leader=True,
-            containers=[container],
-            relations=[relation],
+            containers=[synced_container],
+            relations=[relation, _provider_relation()],
             secrets=[pat_secret],
             config={FILE_PATH_CONFIG: "providers.ini"},
         )
@@ -148,3 +200,31 @@ class TestReconcile:
         )
         state_out = context.run(context.on.relation_changed(relation), state)
         assert isinstance(state_out.unit_status, ops.BlockedStatus)
+
+
+class TestSyncNowAction:
+    def test_sync_now_publishes(self, context, synced_container):
+        """The sync-now action re-reads and republishes the configuration."""
+        git_relation = _public_relation()
+        provider_relation = _provider_relation()
+        state = ops.testing.State(
+            leader=True,
+            containers=[synced_container],
+            relations=[git_relation, provider_relation],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        state_out = context.run(context.on.action("sync-now"), state)
+        out_provider = state_out.get_relation(provider_relation.id)
+        assert "provider-configuration" in out_provider.local_app_data
+
+    def test_sync_now_fails_when_file_missing(self, context, container):
+        """sync-now fails cleanly (not an unhandled traceback) if the file is missing."""
+        git_relation = _public_relation()
+        state = ops.testing.State(
+            leader=True,
+            containers=[container],
+            relations=[git_relation],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        with pytest.raises(ops.testing.ActionFailed):
+            context.run(context.on.action("sync-now"), state)
