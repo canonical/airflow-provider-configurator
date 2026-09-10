@@ -99,3 +99,10 @@ parts:
     source: .
     stage:
       - LICENSE
+
+actions:
+  sync-now:
+    description: |
+      Force an immediate git-sync run and republish provider configuration to
+      related airflow-coordinator apps, instead of waiting for the next
+      pebble-custom-notice or event trigger.
