@@ -18,7 +18,6 @@ file discovery, validation, and publishing) is added in follow-up work.
 
 import logging
 import shlex
-from typing import Any
 
 import charms.git_integrator.v0.git as git
 import ops
@@ -107,12 +106,14 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         """Idempotent reconcile: validate prerequisites and configure git-sync."""
         try:
             self._validate_prerequisites()
+            self._configure_pebble_layer()
         except ExceptionWithStatusError as e:
+            # Prerequisites not met or configuration failed: stop git-sync so it
+            # doesn't keep polling a stale/unrelated repo, then report status.
             logger.error(e)
             self._stop_git_sync()
             self.unit.status = e.status
             return
-        self._configure_pebble_layer()
         self.unit.status = ops.ActiveStatus()
 
     def _validate_prerequisites(self) -> None:
@@ -162,16 +163,25 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         """
         git_info = self._git_connection_info()
         token = git_info.credentials_personal_access_token if git_info else None
-        if token:
+        if not token:
+            return
+        try:
             self._container.push(
                 GIT_SYNC_PASSWORD_FILE, token, make_dirs=True, permissions=0o400
             )
+        except ops.pebble.PathError as e:
+            raise ExceptionWithStatusError(
+                "Failed to write git credentials to the workload container.",
+                ops.BlockedStatus,
+            ) from e
 
     @property
-    def _git_sync_layer(self) -> ops.pebble.LayerDict:
+    def _git_sync_layer(self) -> ops.pebble.Layer:
         """Build the Pebble layer that runs git-sync in continuous poll mode."""
         git_info = self._git_connection_info()
-        service: dict[str, Any] = {
+        if git_info is None:
+            raise ExceptionWithStatusError(INVALID_GIT_RELATION_MESSAGE, ops.BlockedStatus)
+        service: ops.pebble.ServiceDict = {
             "override": "replace",
             "summary": "git-sync",
             "command": self._git_sync_command(git_info),
@@ -180,13 +190,14 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         environment = self._git_sync_environment(git_info)
         if environment:
             service["environment"] = environment
-        return {
+        layer: ops.pebble.LayerDict = {
             "summary": "git-sync layer",
             "description": "Continuously sync provider configuration from git.",
             "services": {GIT_SYNC_SERVICE: service},
         }
+        return ops.pebble.Layer(layer)
 
-    def _git_sync_command(self, git_info: git.GitProviderModel | None) -> str:
+    def _git_sync_command(self, git_info: git.GitProviderModel) -> str:
         """Construct the git-sync command line for continuous polling.
 
         Runs git-sync as a long-lived service that re-syncs every `--period`.
@@ -195,7 +206,6 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         command line / process list. Arguments are joined with shlex.join so a
         relation value containing whitespace cannot inject extra flags.
         """
-        assert git_info is not None  # guaranteed by _validate_prerequisites
         parts = [
             "/bin/git-sync",
             f"--repo={git_info.repository_url}",
@@ -209,7 +219,7 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
             parts.append(f"--username={git_info.credentials_username}")
         return shlex.join(parts)
 
-    def _git_sync_environment(self, git_info: git.GitProviderModel | None) -> dict[str, str]:
+    def _git_sync_environment(self, git_info: git.GitProviderModel) -> dict[str, str]:
         """Environment for the git-sync service.
 
         The personal access token is referenced via GITSYNC_PASSWORD_FILE (a
@@ -217,7 +227,7 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         process list or the service environment.
         """
         env: dict[str, str] = {}
-        if git_info and git_info.credentials_personal_access_token:
+        if git_info.credentials_personal_access_token:
             env["GITSYNC_PASSWORD_FILE"] = GIT_SYNC_PASSWORD_FILE
         return env
 
