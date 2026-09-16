@@ -62,6 +62,24 @@ def synced_container(tmp_path):
 
 
 @pytest.fixture
+def subdir_synced_container(tmp_path):
+    """A git-sync container whose provider .ini lives under a `path` subdirectory.
+
+    Mirrors a repo scoped with the git relation's `path` field: the file is at
+    /git/repo/<path>/<file_path> inside the container.
+    """
+    repo_dir = tmp_path / "repo"
+    subdir = repo_dir / "custom" / "sub"
+    subdir.mkdir(parents=True)
+    (subdir / "providers.ini").write_text(SAMPLE_INI)
+    return ops.testing.Container(
+        name="git-sync",
+        can_connect=True,
+        mounts={"content": ops.testing.Mount(location="/git/repo", source=repo_dir)},
+    )
+
+
+@pytest.fixture
 def pat_secret():
     return ops.testing.Secret({PAT_SECRET_KEY: "custom-personal-access-token"})
 
@@ -108,6 +126,19 @@ def _ssh_relation():
 def _provider_relation():
     """The provides relation to a coordinator, so publishing has a target."""
     return ops.testing.Relation(PROVIDER_RELATION, interface="airflow_provider_configuration")
+
+
+def _subdir_relation():
+    """A git relation that scopes the config under a `path` subdirectory."""
+    return ops.testing.Relation(
+        GIT_RELATION,
+        interface="git",
+        remote_app_data={
+            "repository-url": "https://github.com/example/provider-config",
+            "tracking-ref": "main",
+            "path": "custom/sub",
+        },
+    )
 
 
 class TestReconcile:
@@ -184,6 +215,34 @@ class TestReconcile:
         out_provider = state_out.get_relation(provider_relation.id)
         assert "provider-configuration" in out_provider.local_app_data
 
+    def test_config_read_from_relation_path_subdirectory(self, context, subdir_synced_container):
+        """The git relation's `path` scopes where the config file is read from."""
+        git_relation = _subdir_relation()
+        provider_relation = _provider_relation()
+        state = ops.testing.State(
+            leader=True,
+            containers=[subdir_synced_container],
+            relations=[git_relation, provider_relation],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        state_out = context.run(context.on.relation_changed(git_relation), state)
+        assert state_out.unit_status == ops.ActiveStatus()
+        out_provider = state_out.get_relation(provider_relation.id)
+        assert "provider-configuration" in out_provider.local_app_data
+
+    def test_blocked_when_file_missing_under_relation_path(self, context, synced_container):
+        """`path` is set but the file isn't under that subdirectory -> BlockedStatus."""
+        git_relation = _subdir_relation()  # expects /git/repo/custom/sub/providers.ini
+        state = ops.testing.State(
+            leader=True,
+            containers=[synced_container],  # file is at /git/repo/providers.ini, not the subdir
+            relations=[git_relation, _provider_relation()],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        state_out = context.run(context.on.relation_changed(git_relation), state)
+        assert isinstance(state_out.unit_status, ops.BlockedStatus)
+        assert "custom/sub/providers.ini" in state_out.unit_status.message
+
     def test_https_auth_sets_username_and_writes_password_file(
         self, context, synced_container, pat_secret
     ):
@@ -207,8 +266,7 @@ class TestReconcile:
 
         # The token is referenced via a private file, not an inline env value.
         assert (
-            service.environment.get("GITSYNC_PASSWORD_FILE")
-            == charm_module.GIT_SYNC_PASSWORD_FILE
+            service.environment.get("GITSYNC_PASSWORD_FILE") == charm_module.GIT_SYNC_PASSWORD_FILE
         )
         assert "GITSYNC_PASSWORD" not in service.environment
 

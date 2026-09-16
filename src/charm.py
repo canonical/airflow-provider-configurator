@@ -21,6 +21,7 @@ publishes the configuration.
 import json
 import logging
 import shlex
+from pathlib import PurePosixPath
 
 import charms.git_integrator.v0.git as git
 import ops
@@ -102,6 +103,21 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         """The configured path to the provider .ini file, or None if unset."""
         value = self.config.get(CONFIG_FILE_PATH)
         return str(value) if value else None
+
+    @property
+    def _resolved_file_path(self) -> str:
+        """The configured file path, resolved against the git relation's `path`.
+
+        The git relation may advertise an optional `path`: a subdirectory within
+        the repository that scopes where the provider config lives. git-sync
+        checks the whole repo out under GIT_SYNC_ROOT/GIT_SYNC_DEST, so `path`
+        only matters at read time — the configured file is resolved relative to
+        that subdirectory when one is advertised.
+        """
+        file_path = self._file_path or ""
+        git_info = self._git_connection_info()
+        subdir = (git_info.path if git_info else None) or ""
+        return str(PurePosixPath(subdir) / file_path) if subdir else file_path
 
     def _git_connection_info(self) -> git.GitProviderModel | None:
         """Return the git connection info for this charm's git relation, if ready.
@@ -240,15 +256,20 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
     def _read_synced_file(self) -> str:
         """Read the configured .ini from the synced git content.
 
+        The file is located relative to the git relation's optional `path`
+        subdirectory, so a repo that scopes its config under a sub-folder is
+        honored (spec / review comment on the unused `path` field).
+
         Raises:
             ExceptionWithStatusError: if the file does not exist (spec 1.3).
         """
-        full_path = f"{GIT_SYNC_ROOT}/{GIT_SYNC_DEST}/{self._file_path}"
+        resolved_path = self._resolved_file_path
+        full_path = f"{GIT_SYNC_ROOT}/{GIT_SYNC_DEST}/{resolved_path}"
         try:
             return self._container.pull(full_path, encoding="utf-8").read()
         except ops.pebble.PathError as e:
             raise ExceptionWithStatusError(
-                f"Configuration file not found at {self._file_path}; "
+                f"Configuration file not found at {resolved_path}; "
                 "check the repository and file path.",
                 ops.BlockedStatus,
             ) from e
@@ -267,9 +288,7 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         if not token:
             return
         try:
-            self._container.push(
-                GIT_SYNC_PASSWORD_FILE, token, make_dirs=True, permissions=0o400
-            )
+            self._container.push(GIT_SYNC_PASSWORD_FILE, token, make_dirs=True, permissions=0o400)
         except ops.pebble.PathError as e:
             raise ExceptionWithStatusError(
                 "Failed to write git credentials to the workload container.",
