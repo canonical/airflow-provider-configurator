@@ -76,9 +76,7 @@ class TestReconcile:
     def test_blocked_without_file_path(self, context, container):
         state = ops.testing.State(leader=True, containers=[container])
         state_out = context.run(context.on.config_changed(), state)
-        assert state_out.unit_status == ops.BlockedStatus(
-            charm_module.MISSING_FILE_PATH_MESSAGE
-        )
+        assert state_out.unit_status == ops.BlockedStatus(charm_module.MISSING_FILE_PATH_MESSAGE)
 
     def test_blocked_without_git_relation(self, context, container):
         state = ops.testing.State(
@@ -146,8 +144,7 @@ class TestReconcile:
 
         # The token is referenced via a private file, not an inline env value.
         assert (
-            service.environment.get("GITSYNC_PASSWORD_FILE")
-            == charm_module.GIT_SYNC_PASSWORD_FILE
+            service.environment.get("GITSYNC_PASSWORD_FILE") == charm_module.GIT_SYNC_PASSWORD_FILE
         )
         assert "GITSYNC_PASSWORD" not in service.environment
 
@@ -186,9 +183,7 @@ class TestReconcile:
             config={FILE_PATH_CONFIG: "providers.ini"},
         )
         state_out = context.run(context.on.relation_changed(relation), state)
-        assert state_out.unit_status == ops.BlockedStatus(
-            charm_module.SSH_NOT_SUPPORTED_MESSAGE
-        )
+        assert state_out.unit_status == ops.BlockedStatus(charm_module.SSH_NOT_SUPPORTED_MESSAGE)
 
     def test_git_sync_stopped_when_relation_broken(self, context, container):
         """When the git relation is removed, git-sync must stop (no stale polling)."""
@@ -220,7 +215,4 @@ class TestReconcile:
         state_out = context.run(context.on.update_status(), state)
         assert isinstance(state_out.unit_status, ops.BlockedStatus)
         out_container = state_out.get_container("git-sync")
-        assert (
-            out_container.service_statuses.get("git-sync")
-            != ops.pebble.ServiceStatus.ACTIVE
-        )
+        assert out_container.service_statuses.get("git-sync") != ops.pebble.ServiceStatus.ACTIVE

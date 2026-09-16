@@ -166,9 +166,7 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         if not token:
             return
         try:
-            self._container.push(
-                GIT_SYNC_PASSWORD_FILE, token, make_dirs=True, permissions=0o400
-            )
+            self._container.push(GIT_SYNC_PASSWORD_FILE, token, make_dirs=True, permissions=0o400)
         except ops.pebble.PathError as e:
             raise ExceptionWithStatusError(
                 "Failed to write git credentials to the workload container.",
