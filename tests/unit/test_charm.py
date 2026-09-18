@@ -185,6 +185,42 @@ class TestReconcile:
         state_out = context.run(context.on.relation_changed(relation), state)
         assert state_out.unit_status == ops.BlockedStatus(charm_module.SSH_NOT_SUPPORTED_MESSAGE)
 
+    def test_blocked_on_invalid_git_relation(self, context, container):
+        """A git relation present but without usable connection info blocks the unit."""
+        relation = ops.testing.Relation(GIT_RELATION, interface="git", remote_app_data={})
+        state = ops.testing.State(
+            leader=True,
+            containers=[container],
+            relations=[relation],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        state_out = context.run(context.on.relation_changed(relation), state)
+        assert state_out.unit_status == ops.BlockedStatus(
+            charm_module.INVALID_GIT_RELATION_MESSAGE
+        )
+
+    def test_blocked_when_credentials_push_fails(
+        self, context, container, pat_secret, monkeypatch
+    ):
+        """If writing the credentials file fails, the unit blocks instead of crashing."""
+        relation = _credentials_relation(pat_secret)
+        state = ops.testing.State(
+            leader=True,
+            containers=[container],
+            relations=[relation],
+            secrets=[pat_secret],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+
+        def _raise_path_error(*args, **kwargs):
+            raise ops.pebble.PathError("generic-file-error", "cannot write file")
+
+        monkeypatch.setattr(ops.Container, "push", _raise_path_error)
+        state_out = context.run(context.on.relation_changed(relation), state)
+        assert state_out.unit_status == ops.BlockedStatus(
+            "Failed to write git credentials to the workload container."
+        )
+
     def test_git_sync_stopped_when_relation_broken(self, context, container):
         """When the git relation is removed, git-sync must stop (no stale polling)."""
         # Start with a running git-sync service in the container.

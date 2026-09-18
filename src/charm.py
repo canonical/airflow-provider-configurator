@@ -160,10 +160,15 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         The token is stored in a root-only file inside the container and passed to
         git-sync via GITSYNC_PASSWORD_FILE, so it appears neither on the command
         line nor in the service environment.
+
+        When no token is available (e.g. the relation dropped its credentials or
+        the token was rotated to empty), any previously written credentials file
+        is removed so a stale secret does not linger in the container.
         """
         git_info = self._git_connection_info()
         token = git_info.credentials_personal_access_token if git_info else None
         if not token:
+            self._container.remove_path(GIT_SYNC_PASSWORD_FILE, recursive=True)
             return
         try:
             self._container.push(GIT_SYNC_PASSWORD_FILE, token, make_dirs=True, permissions=0o400)
