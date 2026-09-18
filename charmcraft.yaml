@@ -29,10 +29,64 @@ platforms:
 
 assumes:
   - juju >= 3.6
+  - k8s-api
+
+containers:
+  git-sync:
+    resource: git-sync-image
+    mounts:
+      - storage: content-from-git
+        location: /git
+
+resources:
+  git-sync-image:
+    type: oci-image
+    description: OCI image for git-sync.
+    upstream-source: ubuntu/git-sync@sha256:c697bed78c0e2fbb9ef274cc4be693d74da27327a7158625a3cd2d39dd9437e2  # renovate: oci-image tag: 4.7-26.04_edge
+
+storage:
+  content-from-git:
+    type: filesystem
+    description: >
+      Where to store the checked-out provider configuration content from the git
+      repository.
 
 provides:
   airflow-provider-configuration:
     interface: airflow_provider_configuration
+
+requires:
+  remote-airflow-provider-configurations:
+    interface: git
+    limit: 1
+    optional: false
+
+peers:
+  replicas:
+    interface: airflow_provider_configurator_replica
+
+config:
+  options:
+    airflow_provider_configurations_secret:
+      type: secret
+      description: |
+        A Juju secret that contains a JSON string under the key
+        `airflow_provider_configurations`, a map of provider name to a nested
+        section/option map of sensitive config values, e.g.:
+        {"provider": {"section": {"option": "secret-value"}}}
+        The provider-name nesting is for the admin's authoring convenience; the
+        charm flattens it (drops the provider key, keeps the nested
+        section/option/value structure).
+    airflow_provider_configurations_file_path:
+      type: string
+      description: |
+        (Required) Path to the .ini file containing non-sensitive provider
+        configuration, relative to the root of the git repository.
+    airflow_provider_configurations_sync_period:
+      type: string
+      default: "60s"
+      description: |
+        Poll interval passed to git-sync's --period flag for the continuous sync.
 
 parts:
   charm:
