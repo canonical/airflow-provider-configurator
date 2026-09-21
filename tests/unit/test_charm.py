@@ -84,6 +84,32 @@ def pat_secret():
     return ops.testing.Secret({PAT_SECRET_KEY: "custom-personal-access-token"})
 
 
+@pytest.fixture
+def empty_synced_container(tmp_path):
+    """A git-sync container whose synced provider .ini is present but empty.
+
+    Models an admin deliberately committing an empty file to remove all provider
+    config (spec 2.2), as distinct from a file that is absent entirely (spec 1.3).
+    """
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    (repo_dir / "providers.ini").write_text("")
+    return ops.testing.Container(
+        name="git-sync",
+        can_connect=True,
+        mounts={"content": ops.testing.Mount(location="/git/repo", source=repo_dir)},
+    )
+
+
+def _peer_relation(local_app_data=None):
+    """The replicas peer relation used to store the published-config hash."""
+    return ops.testing.PeerRelation(
+        "replicas",
+        interface="airflow_provider_configurator_replica",
+        local_app_data=local_app_data or {},
+    )
+
+
 def _public_relation():
     """A git relation for a public repo (no auth)."""
     return ops.testing.Relation(
@@ -519,3 +545,136 @@ class TestSensitiveData:
         charm_secret_uri = out_provider.local_app_data["provider-configuration-secret-uri"]
         content = state_out.get_secret(id=charm_secret_uri).latest_content
         assert json.loads(content["sensitive-data"]) == {}
+
+
+class TestConfigHashDedup:
+    """Peer-hash dedup (spec 1.2): republish only when the config changed."""
+
+    def test_hash_stored_after_publish(self, context, synced_container):
+        """A successful publish records the config hash in the peer databag."""
+        git_relation = _public_relation()
+        state = ops.testing.State(
+            leader=True,
+            containers=[synced_container],
+            relations=[git_relation, _provider_relation(), _peer_relation()],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        state_out = context.run(context.on.relation_changed(git_relation), state)
+        assert state_out.unit_status == ops.ActiveStatus()
+
+        peer = state_out.get_relation(
+            next(r.id for r in state_out.relations if r.endpoint == "replicas")
+        )
+        assert peer.local_app_data.get(charm_module.PEER_CONFIG_HASH_KEY)
+
+    def test_unchanged_config_skips_republish(self, context, synced_container):
+        """A second reconcile with identical content must not rewrite the secret."""
+        from unittest.mock import patch
+
+        git_relation = _public_relation()
+        state = ops.testing.State(
+            leader=True,
+            containers=[synced_container],
+            relations=[git_relation, _provider_relation(), _peer_relation()],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        # First reconcile publishes and stores the hash.
+        state_after_first = context.run(context.on.relation_changed(git_relation), state)
+
+        # Second reconcile over the resulting state (hash already stored): the
+        # publish path must be skipped, so set_configuration is never called.
+        with patch("charm.AirflowProviderConfiguratorProvides.set_configuration") as mock_set:
+            context.run(context.on.update_status(), state_after_first)
+            mock_set.assert_not_called()
+
+    def test_changed_config_republishes(self, context, synced_container, tmp_path):
+        """When the synced content changes, the new config is republished."""
+        from unittest.mock import patch
+
+        git_relation = _public_relation()
+        # Pre-seed the peer databag with a stale hash so any real config differs.
+        state = ops.testing.State(
+            leader=True,
+            containers=[synced_container],
+            relations=[
+                git_relation,
+                _provider_relation(),
+                _peer_relation(local_app_data={charm_module.PEER_CONFIG_HASH_KEY: "stale"}),
+            ],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        with patch("charm.AirflowProviderConfiguratorProvides.set_configuration") as mock_set:
+            context.run(context.on.relation_changed(git_relation), state)
+            mock_set.assert_called_once()
+
+
+class TestEmptyConfigCleanup:
+    """Empty-data cleanup (spec 2.2): present-but-empty file clears published data."""
+
+    def test_present_but_empty_file_is_active_and_clears(self, context, empty_synced_container):
+        """An empty (but present) file -> Active + clear_configuration (spec 2.2)."""
+        from unittest.mock import patch
+
+        git_relation = _public_relation()
+        state = ops.testing.State(
+            leader=True,
+            containers=[empty_synced_container],
+            relations=[
+                git_relation,
+                _provider_relation(),
+                _peer_relation(local_app_data={charm_module.PEER_CONFIG_HASH_KEY: "stale"}),
+            ],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        with (
+            patch("charm.AirflowProviderConfiguratorProvides.clear_configuration") as mock_clear,
+            patch("charm.AirflowProviderConfiguratorProvides.set_configuration") as mock_set,
+        ):
+            state_out = context.run(context.on.relation_changed(git_relation), state)
+            mock_clear.assert_called_once()
+            mock_set.assert_not_called()
+        # Present-but-empty is a valid state, not a blocked one (contrast spec 1.3).
+        assert state_out.unit_status == ops.ActiveStatus()
+
+    def test_absent_file_still_blocks(self, context, container):
+        """A file that is absent entirely still blocks (spec 1.3, unchanged)."""
+        git_relation = _public_relation()
+        state = ops.testing.State(
+            leader=True,
+            containers=[container],  # no mounted repo -> file absent
+            relations=[git_relation, _provider_relation(), _peer_relation()],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        state_out = context.run(context.on.relation_changed(git_relation), state)
+        assert isinstance(state_out.unit_status, ops.BlockedStatus)
+
+    def test_sensitive_only_is_valid_publish_not_cleanup(self, context, empty_synced_container):
+        """Empty .ini but sensitive data present -> valid publish, not cleanup.
+
+        This is the Q1 case: 'empty' means BOTH inputs empty. Sensitive-only is a
+        legitimate configuration and must publish, not trigger cleanup.
+        """
+        from unittest.mock import patch
+
+        git_relation = _public_relation()
+        user_secret = ops.testing.Secret(
+            {SENSITIVE_CONFIG_KEY: json.dumps({"p": {"gcs": {"conn_id": "s3cret"}}})}
+        )
+        state = ops.testing.State(
+            leader=True,
+            containers=[empty_synced_container],
+            relations=[git_relation, _provider_relation(), _peer_relation()],
+            secrets=[user_secret],
+            config={
+                FILE_PATH_CONFIG: "providers.ini",
+                SENSITIVE_SECRET_CONFIG: user_secret.id,
+            },
+        )
+        with (
+            patch("charm.AirflowProviderConfiguratorProvides.clear_configuration") as mock_clear,
+            patch("charm.AirflowProviderConfiguratorProvides.set_configuration") as mock_set,
+        ):
+            state_out = context.run(context.on.relation_changed(git_relation), state)
+            mock_set.assert_called_once()
+            mock_clear.assert_not_called()
+        assert state_out.unit_status == ops.ActiveStatus()

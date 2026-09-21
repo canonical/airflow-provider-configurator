@@ -93,6 +93,51 @@ class TestProvides:
             "sensitive-data": json.dumps(SAMPLE_SENSITIVE)
         }
 
+    def test_clear_configuration_empties_databag_and_removes_secret(
+        self, provider_context, relation
+    ):
+        """clear_configuration removes the databag keys and the charm secret."""
+        state = ops.testing.State(leader=True, relations=[relation])
+        with provider_context(provider_context.on.relation_changed(relation), state) as manager:
+            # Publish first, so there is something to clear.
+            manager.charm.provider.set_configuration(
+                provider_configuration=SAMPLE_TEMPLATE,
+                provider_configuration_sensitive_data=SAMPLE_SENSITIVE,
+            )
+            # Then clear it.
+            manager.charm.provider.clear_configuration()
+            state_out = manager.run()
+
+        out_relation = state_out.get_relation(relation.id)
+        assert "provider-configuration" not in out_relation.local_app_data
+        assert "provider-configuration-secret-uri" not in out_relation.local_app_data
+        # The charm secret is gone (all revisions removed).
+        assert not state_out.secrets
+
+    def test_clear_configuration_noop_when_not_leader(self, provider_context, relation):
+        """clear_configuration is a no-op on a non-leader unit."""
+        state = ops.testing.State(leader=False, relations=[relation])
+        with provider_context(provider_context.on.relation_changed(relation), state) as manager:
+            manager.charm.provider.clear_configuration()
+            state_out = manager.run()
+
+        out_relation = state_out.get_relation(relation.id)
+        assert "provider-configuration" not in out_relation.local_app_data
+
+    def test_clear_configuration_idempotent_when_nothing_published(
+        self, provider_context, relation
+    ):
+        """Clearing when nothing was ever published is safe (no secret to remove)."""
+        state = ops.testing.State(leader=True, relations=[relation])
+        with provider_context(provider_context.on.relation_changed(relation), state) as manager:
+            # No prior set_configuration: the charm secret does not exist.
+            manager.charm.provider.clear_configuration()
+            state_out = manager.run()
+
+        out_relation = state_out.get_relation(relation.id)
+        assert "provider-configuration" not in out_relation.local_app_data
+        assert not state_out.secrets
+
 
 class TestRequires:
     def _remote_data_with_secret(self):

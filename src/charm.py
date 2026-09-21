@@ -18,6 +18,7 @@ reads the synced .ini, combines it with sensitive data from the user secret, and
 publishes the configuration.
 """
 
+import hashlib
 import json
 import logging
 import shlex
@@ -43,6 +44,8 @@ from constants import (
     INVALID_GIT_RELATION_MESSAGE,
     MISSING_FILE_PATH_MESSAGE,
     MISSING_GIT_RELATION_MESSAGE,
+    PEER_CONFIG_HASH_KEY,
+    PEER_RELATION_NAME,
     SSH_NOT_SUPPORTED_MESSAGE,
     WAITING_FOR_CONTAINER_MESSAGE,
     WORKLOAD_CONTAINER,
@@ -251,6 +254,15 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         values (from the user secret) into a template + sensitive map, and
         publishes via the provider interface.
 
+        A hash of the resulting (template, sensitive map) is stored in the peer
+        relation and compared on each call: when nothing has changed the publish
+        is skipped entirely, avoiding relation/secret churn on every event or
+        notice (spec 1.2). When the configuration is empty — no non-sensitive
+        template and no sensitive data — the previously published configuration
+        is cleared and its charm secret revoked (spec 2.2); this is the case of a
+        file that is present but empty, as distinct from an absent file (handled
+        as BlockedStatus in _read_synced_file, spec 1.3).
+
         Raises:
             ExceptionWithStatusError: if the file is missing, or the sensitive
                 secret is set but unreadable / invalid / has a collision.
@@ -260,10 +272,60 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         template, flat_sensitive = config_generator.build_template_and_secrets(
             ini_content, sensitive_data=sensitive_data
         )
-        self._config_provider.set_configuration(
-            provider_configuration=template,
-            provider_configuration_sensitive_data=flat_sensitive,
-        )
+
+        config_hash = self._config_hash(template, flat_sensitive)
+        if config_hash == self._stored_config_hash:
+            # Nothing changed since the last successful publish: skip to avoid
+            # churning the relation databag and secret revisions.
+            return
+
+        if not template and not flat_sensitive:
+            # Both inputs empty (present-but-empty file and no sensitive data):
+            # remove any previously published configuration (spec 2.2).
+            self._config_provider.clear_configuration()
+        else:
+            self._config_provider.set_configuration(
+                provider_configuration=template,
+                provider_configuration_sensitive_data=flat_sensitive,
+            )
+        self._store_config_hash(config_hash)
+
+    @staticmethod
+    def _config_hash(template: str, flat_sensitive: dict[str, str]) -> str:
+        """Return a stable hash of the publishable configuration.
+
+        Hashes the derived (template, sensitive map) rather than the raw .ini so
+        the hash also changes when only the sensitive secret changes; the sole
+        purpose is deciding whether a republish is needed (spec 1.2). Keys are
+        sorted so the hash is independent of dict ordering.
+        """
+        payload = json.dumps({"template": template, "sensitive": flat_sensitive}, sort_keys=True)
+        return hashlib.sha256(payload.encode()).hexdigest()
+
+    @property
+    def _stored_config_hash(self) -> str | None:
+        """The hash of the last published configuration, from the peer databag.
+
+        Returns None if there is no peer relation yet or nothing has been
+        published, in which case any computed hash counts as a change.
+        """
+        relation = self.model.get_relation(PEER_RELATION_NAME)
+        if relation is None:
+            return None
+        return relation.data[self.app].get(PEER_CONFIG_HASH_KEY)
+
+    def _store_config_hash(self, config_hash: str) -> None:
+        """Persist the published-configuration hash in the peer app databag.
+
+        Only the leader writes app data; on a non-leader this is a no-op, matching
+        the interface methods that also only publish when leader.
+        """
+        if not self.unit.is_leader():
+            return
+        relation = self.model.get_relation(PEER_RELATION_NAME)
+        if relation is None:
+            return
+        relation.data[self.app][PEER_CONFIG_HASH_KEY] = config_hash
 
     def _read_synced_file(self) -> str:
         """Read the configured .ini from the synced git content.

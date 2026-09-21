@@ -5,6 +5,11 @@
 
 # Relations and workload.
 GIT_RELATION_NAME = "remote-airflow-provider-configurations"
+# Peer relation used to store the hash of the last published configuration, so
+# republishing is skipped when nothing changed (spec 1.2).
+PEER_RELATION_NAME = "replicas"
+# Key under the peer app databag holding that hash.
+PEER_CONFIG_HASH_KEY = "published-config-hash"
 WORKLOAD_CONTAINER = "git-sync"
 GIT_SYNC_SERVICE = "git-sync"
 GIT_SYNC_ROOT = "/git"

@@ -204,6 +204,41 @@ class AirflowProviderConfiguratorProvides(ops.Object):
             databag[DATABAG_KEY_CONFIGURATION] = provider_configuration
             databag[DATABAG_KEY_SECRET_URI] = secret.id
 
+    def clear_configuration(self) -> None:
+        """Remove any published provider configuration and revoke the charm secret.
+
+        Reverses set_configuration: clears the relation databag keys, then revokes
+        and removes the charm secret holding the sensitive data. Used when the
+        provider configuration becomes empty (spec 2.2), so the coordinator stops
+        rendering stale provider config into airflow.cfg.
+
+        The steps run in reverse order of set_configuration: the databag keys are
+        cleared first (so a requirer reading mid-transition never sees a secret URI
+        pointing at an already-removed secret), then the secret is revoked and
+        removed. No-op if there is no relation or if this unit is not the leader;
+        safe to call when nothing was ever published (the secret simply won't
+        exist).
+        """
+        if not self._charm.unit.is_leader():
+            return
+        relations = self._charm.model.relations[self._relation_name]
+        if not relations:
+            return
+
+        for relation in relations:
+            databag = relation.data[self._charm.app]
+            databag.pop(DATABAG_KEY_CONFIGURATION, None)
+            databag.pop(DATABAG_KEY_SECRET_URI, None)
+
+        try:
+            secret = self._charm.model.get_secret(label=CHARM_PROVIDER_CONFIG_SECRET_LABEL)
+        except ops.SecretNotFoundError:
+            # Nothing was ever published (or it's already been cleared): idempotent.
+            return
+        for relation in relations:
+            secret.revoke(relation)
+        secret.remove_all_revisions()
+
 
 class AirflowProviderConfiguratorRequires(ops.Object):
     """Requirer side of the airflow_provider_configuration relation.
