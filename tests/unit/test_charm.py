@@ -252,3 +252,25 @@ class TestReconcile:
         assert isinstance(state_out.unit_status, ops.BlockedStatus)
         out_container = state_out.get_container("git-sync")
         assert out_container.service_statuses.get("git-sync") != ops.pebble.ServiceStatus.ACTIVE
+
+    def test_git_credentials_removed_when_relation_broken(self, context, tmp_path):
+        """Removing the git relation must also delete any stored credentials file."""
+        # Pre-seed a credentials file inside the container via a mount.
+        creds_dir = tmp_path / "git-creds"
+        creds_dir.mkdir()
+        password_file = creds_dir / "password"
+        password_file.write_text("stale-token")
+        mount_point = charm_module.GIT_SYNC_PASSWORD_FILE.rsplit("/", 1)[0]
+        seeded = ops.testing.Container(
+            name="git-sync",
+            can_connect=True,
+            mounts={"creds": ops.testing.Mount(location=mount_point, source=creds_dir)},
+        )
+        # No git relation present -> prerequisites fail -> credentials removed.
+        state = ops.testing.State(
+            leader=True,
+            containers=[seeded],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        context.run(context.on.update_status(), state)
+        assert not password_file.exists()

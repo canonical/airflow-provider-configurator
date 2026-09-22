@@ -145,12 +145,15 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
 
         Called when prerequisites are no longer met (e.g. the git relation was
         removed). Safe to call when the container is unreachable or the service
-        was never started.
+        was never started. Also removes any stored git credentials so a rotated
+        or revoked token does not linger once the relation is gone (the
+        reconcile early-return means _push_git_credentials would not run).
         """
         if not self._container.can_connect():
             return
         if GIT_SYNC_SERVICE in self._container.get_services():
             self._container.stop(GIT_SYNC_SERVICE)
+        self._container.remove_path(GIT_SYNC_PASSWORD_FILE, recursive=True)
 
     # ---- git-sync layer ---------------------------------------------------
 
