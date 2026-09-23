@@ -11,20 +11,30 @@ git-sync; sensitive configuration is supplied via a Juju user secret. Validated
 configuration is relayed to the Airflow Coordinator charm over the
 `airflow_provider_configuration` relation.
 
-This module wires the git input path: the git relation, the config options, and
-the git-sync workload layer. The sync-to-publish flow (Pebble notice handling,
-file discovery, validation, and publishing) is added in follow-up work.
+git-sync runs continuously on its `--period` timer. On each successful sync whose
+content changed, it runs an `--exechook-command` script that calls `pebble notify`,
+which Juju surfaces as a Pebble custom-notice event. The charm observes that event,
+reads the synced .ini, combines it with sensitive data from the user secret, and
+publishes the configuration.
 """
 
+import json
 import logging
 import shlex
+from pathlib import PurePosixPath
 
 import charms.git_integrator.v0.git as git
 import ops
+from airflow_provider_configurator import AirflowProviderConfiguratorProvides
 
+import config_generator
+import sensitive_config
 from constants import (
     CONFIG_FILE_PATH,
+    CONFIG_SENSITIVE_SECRET,
     CONFIG_SYNC_PERIOD,
+    CONTENT_SYNCED_NOTICE_KEY,
+    EXECHOOK_SCRIPT_PATH,
     GIT_RELATION_NAME,
     GIT_SYNC_DEST,
     GIT_SYNC_PASSWORD_FILE,
@@ -68,6 +78,7 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         )
         self._container = self.unit.get_container(WORKLOAD_CONTAINER)
         self._sync_period = str(self.config[CONFIG_SYNC_PERIOD])
+        self._config_provider = AirflowProviderConfiguratorProvides(self)
 
         # GitRequires(callback=...) already observes git_connection_information_updated,
         # relation_joined and relation_broken, so those are not repeated here.
@@ -76,10 +87,14 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
             self.on.config_changed,
             self.on.update_status,
             self.on.upgrade_charm,
+            self.on.secret_changed,
             self.on[WORKLOAD_CONTAINER].pebble_ready,
+            self.on[WORKLOAD_CONTAINER].pebble_custom_notice,
             self.on[GIT_RELATION_NAME].relation_changed,
         ):
             self.framework.observe(event, self._reconcile)
+
+        self.framework.observe(self.on.sync_now_action, self._on_sync_now_action)
 
     # ---- config accessors -------------------------------------------------
 
@@ -88,6 +103,21 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         """The configured path to the provider .ini file, or None if unset."""
         value = self.config.get(CONFIG_FILE_PATH)
         return str(value) if value else None
+
+    @property
+    def _resolved_file_path(self) -> str:
+        """The configured file path, resolved against the git relation's `path`.
+
+        The git relation may advertise an optional `path`: a subdirectory within
+        the repository that scopes where the provider config lives. git-sync
+        checks the whole repo out under GIT_SYNC_ROOT/GIT_SYNC_DEST, so `path`
+        only matters at read time — the configured file is resolved relative to
+        that subdirectory when one is advertised.
+        """
+        file_path = self._file_path or ""
+        git_info = self._git_connection_info()
+        subdir = (git_info.path if git_info else None) or ""
+        return str(PurePosixPath(subdir) / file_path) if subdir else file_path
 
     def _git_connection_info(self) -> git.GitProviderModel | None:
         """Return the git connection info for this charm's git relation, if ready.
@@ -100,18 +130,65 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
             return None
         return self.git_requirer.get_git_connection_information_for_relation(relation.id)
 
+    def _sensitive_data(self) -> dict[str, dict[str, str]]:
+        """Return the flattened sensitive provider config from the user secret.
+
+        The sensitive secret is optional: if the config option is unset, there is
+        no sensitive data and an empty map is returned. If the option is set but
+        the secret is unreadable (not granted, missing), its payload is invalid,
+        or two providers collide on the same section.option, the unit blocks.
+
+        Raises:
+            ExceptionWithStatusError: if the secret is set but cannot be read or
+                parsed, or if a duplicate section.option is found (spec 3.3).
+        """
+        secret_id = self.config.get(CONFIG_SENSITIVE_SECRET)
+        if not secret_id:
+            return {}
+        try:
+            secret = self.model.get_secret(id=str(secret_id))
+            content = secret.get_content(refresh=True)
+        except (ops.SecretNotFoundError, ops.ModelError) as e:
+            raise ExceptionWithStatusError(
+                "Sensitive configuration secret is not accessible; "
+                "check it exists and is granted to this charm.",
+                ops.BlockedStatus,
+            ) from e
+        raw_json = content.get(sensitive_config.SENSITIVE_CONFIG_SECRET_KEY, "")
+        try:
+            return sensitive_config.parse_sensitive_config(raw_json)
+        except (
+            sensitive_config.DuplicateSensitiveKeyError,
+            sensitive_config.InvalidSensitiveConfigError,
+        ) as e:
+            raise ExceptionWithStatusError(str(e), ops.BlockedStatus) from e
+        except json.JSONDecodeError as e:
+            raise ExceptionWithStatusError(
+                "Sensitive configuration secret payload is not valid JSON.",
+                ops.BlockedStatus,
+            ) from e
+
     # ---- reconcile --------------------------------------------------------
 
     def _reconcile(self, _: ops.EventBase) -> None:
-        """Idempotent reconcile: validate prerequisites and configure git-sync."""
+        """Idempotent reconcile: configure git-sync and publish synced config."""
         try:
             self._validate_prerequisites()
-            self._configure_pebble_layer()
         except ExceptionWithStatusError as e:
-            # Prerequisites not met or configuration failed: stop git-sync so it
-            # doesn't keep polling a stale/unrelated repo, then report status.
+            # Prerequisites not met (e.g. git relation removed): stop git-sync so
+            # it doesn't keep polling a stale/unrelated repo, then report status.
             logger.error(e)
             self._stop_git_sync()
+            self.unit.status = e.status
+            return
+        try:
+            self._configure_pebble_layer()
+            self._publish_configuration()
+        except ExceptionWithStatusError as e:
+            # Prerequisites are met and git-sync is configured; a later failure
+            # (e.g. file not yet synced) should not stop git-sync, so it can pick
+            # up the content once it appears.
+            logger.error(e)
             self.unit.status = e.status
             return
         self.unit.status = ops.ActiveStatus()
@@ -135,8 +212,20 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
             raise ExceptionWithStatusError(WAITING_FOR_CONTAINER_MESSAGE, ops.WaitingStatus)
 
     def _configure_pebble_layer(self) -> None:
-        """Push git credentials (if any) and (re)configure the git-sync Pebble layer."""
+        """Push git credentials and the exechook, then (re)configure git-sync."""
         self._push_git_credentials()
+        try:
+            self._container.push(
+                EXECHOOK_SCRIPT_PATH,
+                self._exechook_script(),
+                make_dirs=True,
+                permissions=0o755,
+            )
+        except ops.pebble.PathError as e:
+            raise ExceptionWithStatusError(
+                "Failed to write the git-sync exechook to the workload container.",
+                ops.BlockedStatus,
+            ) from e
         self._container.add_layer(GIT_SYNC_SERVICE, self._git_sync_layer, combine=True)
         self._container.replan()
 
@@ -154,6 +243,48 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         if GIT_SYNC_SERVICE in self._container.get_services():
             self._container.stop(GIT_SYNC_SERVICE)
         self._container.remove_path(GIT_SYNC_PASSWORD_FILE, recursive=True)
+
+    def _publish_configuration(self) -> None:
+        """Read the synced .ini and publish it over the relation.
+
+        Combines the non-sensitive .ini (synced from git) with the sensitive
+        values (from the user secret) into a template + sensitive map, and
+        publishes via the provider interface.
+
+        Raises:
+            ExceptionWithStatusError: if the file is missing, or the sensitive
+                secret is set but unreadable / invalid / has a collision.
+        """
+        ini_content = self._read_synced_file()
+        sensitive_data = self._sensitive_data()
+        template, flat_sensitive = config_generator.build_template_and_secrets(
+            ini_content, sensitive_data=sensitive_data
+        )
+        self._config_provider.set_configuration(
+            provider_configuration=template,
+            provider_configuration_sensitive_data=flat_sensitive,
+        )
+
+    def _read_synced_file(self) -> str:
+        """Read the configured .ini from the synced git content.
+
+        The file is located relative to the git relation's optional `path`
+        subdirectory, so a repo that scopes its config under a sub-folder is
+        honored (spec / review comment on the unused `path` field).
+
+        Raises:
+            ExceptionWithStatusError: if the file does not exist (spec 1.3).
+        """
+        resolved_path = self._resolved_file_path
+        full_path = f"{GIT_SYNC_ROOT}/{GIT_SYNC_DEST}/{resolved_path}"
+        try:
+            return self._container.pull(full_path, encoding="utf-8").read()
+        except ops.pebble.PathError as e:
+            raise ExceptionWithStatusError(
+                f"Configuration file not found at {resolved_path}; "
+                "check the repository and file path.",
+                ops.BlockedStatus,
+            ) from e
 
     # ---- git-sync layer ---------------------------------------------------
 
@@ -181,6 +312,14 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
                 ops.BlockedStatus,
             ) from e
 
+    def _exechook_script(self) -> str:
+        """The script git-sync runs after each changed sync; fires a Pebble notice."""
+        return (
+            "#!/bin/sh\n"
+            "# Notify the charm that git-sync fetched new content.\n"
+            f"exec pebble notify {CONTENT_SYNCED_NOTICE_KEY}\n"
+        )
+
     @property
     def _git_sync_layer(self) -> ops.pebble.Layer:
         """Build the Pebble layer that runs git-sync in continuous poll mode."""
@@ -206,11 +345,12 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
     def _git_sync_command(self, git_info: git.GitProviderModel) -> str:
         """Construct the git-sync command line for continuous polling.
 
-        Runs git-sync as a long-lived service that re-syncs every `--period`.
-        For HTTPS auth only the username is passed here; the token is supplied via
-        a password file (see _git_sync_environment) so it never appears on the
-        command line / process list. Arguments are joined with shlex.join so a
-        relation value containing whitespace cannot inject extra flags.
+        Runs git-sync as a long-lived service that re-syncs every `--period` and
+        runs the exechook on each changed sync. For HTTPS auth only the username
+        is passed here; the token is supplied via a password file (see
+        _git_sync_environment) so it never appears on the command line / process
+        list. Arguments are joined with shlex.join so a relation value containing
+        whitespace cannot inject extra flags.
         """
         parts = [
             "/bin/git-sync",
@@ -218,6 +358,7 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
             f"--root={GIT_SYNC_ROOT}",
             f"--link={GIT_SYNC_DEST}",
             f"--period={self._sync_period}",
+            f"--exechook-command={EXECHOOK_SCRIPT_PATH}",
         ]
         if git_info.tracking_ref:
             parts.append(f"--ref={git_info.tracking_ref}")
@@ -236,6 +377,18 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         if git_info.credentials_personal_access_token:
             env["GITSYNC_PASSWORD_FILE"] = GIT_SYNC_PASSWORD_FILE
         return env
+
+    # ---- actions ----------------------------------------------------------
+
+    def _on_sync_now_action(self, event: ops.ActionEvent) -> None:
+        """Force an immediate re-read and republish of the provider configuration."""
+        try:
+            self._validate_prerequisites()
+            self._publish_configuration()
+        except ExceptionWithStatusError as e:
+            event.fail(e.message)
+            return
+        event.set_results({"result": "Provider configuration republished."})
 
 
 if __name__ == "__main__":  # pragma: nocover
