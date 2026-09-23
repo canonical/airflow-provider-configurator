@@ -274,9 +274,12 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         )
 
         config_hash = self._config_hash(template, flat_sensitive)
-        if config_hash == self._stored_config_hash:
-            # Nothing changed since the last successful publish: skip to avoid
-            # churning the relation databag and secret revisions.
+        if config_hash == self._stored_config_hash and self._config_provider.is_published():
+            # Nothing changed since the last successful publish AND every current
+            # relation already carries the data: skip to avoid churning the
+            # relation databag and secret revisions. The is_published() check
+            # ensures a freshly-joined or re-added relation is still populated
+            # even when the content hash is unchanged (spec 1.2).
             return
 
         if not template and not flat_sensitive:

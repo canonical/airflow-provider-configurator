@@ -138,6 +138,46 @@ class TestProvides:
         assert "provider-configuration" not in out_relation.local_app_data
         assert not state_out.secrets
 
+    def test_is_published_true_when_all_relations_carry_data(self, provider_context, relation):
+        """is_published() is True once every relation databag holds the config keys."""
+        state = ops.testing.State(leader=True, relations=[relation])
+        with provider_context(provider_context.on.relation_changed(relation), state) as manager:
+            manager.charm.provider.set_configuration(
+                provider_configuration=SAMPLE_TEMPLATE,
+                provider_configuration_sensitive_data=SAMPLE_SENSITIVE,
+            )
+            assert manager.charm.provider.is_published() is True
+            manager.run()
+
+    def test_is_published_false_when_a_relation_is_empty(self, provider_context, relation):
+        """A freshly-joined (empty) relation makes is_published() False.
+
+        Even with another relation already published, an empty databag on any
+        relation means the publish must not be skipped (regression for the
+        content-hash dedup stranding a re-added relation).
+        """
+        fresh = ops.testing.Relation(RELATION_NAME, interface=RELATION_INTERFACE)
+        state = ops.testing.State(leader=True, relations=[relation, fresh])
+        with provider_context(provider_context.on.relation_changed(relation), state) as manager:
+            # Publish only reaches both relations, but assert the pre-publish state
+            # first: nothing written yet -> not published.
+            assert manager.charm.provider.is_published() is False
+            manager.run()
+
+    def test_is_published_false_when_not_leader(self, provider_context, relation):
+        """A non-leader never writes the databag, so it reports not published."""
+        state = ops.testing.State(leader=False, relations=[relation])
+        with provider_context(provider_context.on.relation_changed(relation), state) as manager:
+            assert manager.charm.provider.is_published() is False
+            manager.run()
+
+    def test_is_published_false_when_no_relation(self, provider_context):
+        """No relation at all -> not published."""
+        state = ops.testing.State(leader=True, relations=[])
+        with provider_context(provider_context.on.update_status(), state) as manager:
+            assert manager.charm.provider.is_published() is False
+            manager.run()
+
 
 class TestRequires:
     def _remote_data_with_secret(self):

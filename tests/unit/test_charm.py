@@ -607,6 +607,44 @@ class TestConfigHashDedup:
             context.run(context.on.relation_changed(git_relation), state)
             mock_set.assert_called_once()
 
+    def test_new_relation_republishes_despite_unchanged_hash(self, context, synced_container):
+        """A freshly-joined relation is populated even when the content hash is unchanged.
+
+        Content-only dedup must not strand a relation that joined (or was re-added)
+        after the hash was stored: is_published() forces the publish so the new
+        relation databag gets the configuration (spec 1.2).
+        """
+        from unittest.mock import patch
+
+        git_relation = _public_relation()
+        state = ops.testing.State(
+            leader=True,
+            containers=[synced_container],
+            relations=[git_relation, _provider_relation(), _peer_relation()],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        # First reconcile publishes and stores the hash.
+        state_after_first = context.run(context.on.relation_changed(git_relation), state)
+        stored_hash = state_after_first.get_relation(
+            next(r.id for r in state_after_first.relations if r.endpoint == "replicas")
+        ).local_app_data[charm_module.PEER_CONFIG_HASH_KEY]
+
+        # A brand-new provider relation joins with an empty databag while the
+        # stored hash still matches the unchanged content: the publish must run.
+        state_readded = ops.testing.State(
+            leader=True,
+            containers=[synced_container],
+            relations=[
+                git_relation,
+                _provider_relation(),  # fresh relation, empty databag
+                _peer_relation(local_app_data={charm_module.PEER_CONFIG_HASH_KEY: stored_hash}),
+            ],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        with patch("charm.AirflowProviderConfiguratorProvides.set_configuration") as mock_set:
+            context.run(context.on.relation_changed(git_relation), state_readded)
+            mock_set.assert_called_once()
+
 
 class TestEmptyConfigCleanup:
     """Empty-data cleanup (spec 2.2): present-but-empty file clears published data."""

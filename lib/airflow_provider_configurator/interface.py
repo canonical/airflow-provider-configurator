@@ -239,6 +239,29 @@ class AirflowProviderConfiguratorProvides(ops.Object):
             secret.revoke(relation)
         secret.remove_all_revisions()
 
+    def is_published(self) -> bool:
+        """Whether every current relation already carries the published configuration.
+
+        Returns True only if there is at least one relation and every relation
+        databag holds both the configuration template and the secret uri. Callers
+        use this together with the content hash: a hash may be unchanged, but a
+        freshly-joined (or re-added) relation still needs the data written, so a
+        content-only dedup must not skip the publish while this returns False.
+
+        Returns False when this unit is not the leader (a non-leader never writes
+        the databag, so it cannot assert the data is published).
+        """
+        if not self._charm.unit.is_leader():
+            return False
+        relations = self._charm.model.relations[self._relation_name]
+        if not relations:
+            return False
+        return all(
+            DATABAG_KEY_CONFIGURATION in relation.data[self._charm.app]
+            and DATABAG_KEY_SECRET_URI in relation.data[self._charm.app]
+            for relation in relations
+        )
+
 
 class AirflowProviderConfiguratorRequires(ops.Object):
     """Requirer side of the airflow_provider_configuration relation.
