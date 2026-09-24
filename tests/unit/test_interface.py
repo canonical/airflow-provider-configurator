@@ -178,6 +178,51 @@ class TestProvides:
             assert manager.charm.provider.is_published() is False
             manager.run()
 
+    def test_is_cleared_true_when_relation_has_no_keys(self, provider_context, relation):
+        """A relation that carries neither config key is in the cleared state."""
+        state = ops.testing.State(leader=True, relations=[relation])
+        with provider_context(provider_context.on.relation_changed(relation), state) as manager:
+            # Nothing published yet -> cleared.
+            assert manager.charm.provider.is_cleared() is True
+            manager.run()
+
+    def test_is_cleared_false_after_publish(self, provider_context, relation):
+        """Once configuration is published, the relation is no longer cleared."""
+        state = ops.testing.State(leader=True, relations=[relation])
+        with provider_context(provider_context.on.relation_changed(relation), state) as manager:
+            manager.charm.provider.set_configuration(
+                provider_configuration=SAMPLE_TEMPLATE,
+                provider_configuration_sensitive_data=SAMPLE_SENSITIVE,
+            )
+            assert manager.charm.provider.is_cleared() is False
+            manager.run()
+
+    def test_is_cleared_true_after_clear(self, provider_context, relation):
+        """After clear_configuration, the relation reports cleared again."""
+        state = ops.testing.State(leader=True, relations=[relation])
+        with provider_context(provider_context.on.relation_changed(relation), state) as manager:
+            manager.charm.provider.set_configuration(
+                provider_configuration=SAMPLE_TEMPLATE,
+                provider_configuration_sensitive_data=SAMPLE_SENSITIVE,
+            )
+            manager.charm.provider.clear_configuration()
+            assert manager.charm.provider.is_cleared() is True
+            manager.run()
+
+    def test_is_cleared_false_when_not_leader(self, provider_context, relation):
+        """A non-leader cannot assert the cleared state."""
+        state = ops.testing.State(leader=False, relations=[relation])
+        with provider_context(provider_context.on.relation_changed(relation), state) as manager:
+            assert manager.charm.provider.is_cleared() is False
+            manager.run()
+
+    def test_is_cleared_false_when_no_relation(self, provider_context):
+        """No relation at all -> not cleared (there is nothing to be cleared)."""
+        state = ops.testing.State(leader=True, relations=[])
+        with provider_context(provider_context.on.update_status(), state) as manager:
+            assert manager.charm.provider.is_cleared() is False
+            manager.run()
+
 
 class TestRequires:
     def _remote_data_with_secret(self):

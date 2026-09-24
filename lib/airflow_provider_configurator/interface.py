@@ -243,7 +243,7 @@ class AirflowProviderConfiguratorProvides(ops.Object):
         """Whether every current relation already carries the published configuration.
 
         Returns True only if there is at least one relation and every relation
-        databag holds both the configuration template and the secret uri. Callers
+        databag holds both the configuration template and the secret URI. Callers
         use this together with the content hash: a hash may be unchanged, but a
         freshly-joined (or re-added) relation still needs the data written, so a
         content-only dedup must not skip the publish while this returns False.
@@ -259,6 +259,30 @@ class AirflowProviderConfiguratorProvides(ops.Object):
         return all(
             DATABAG_KEY_CONFIGURATION in relation.data[self._charm.app]
             and DATABAG_KEY_SECRET_URI in relation.data[self._charm.app]
+            for relation in relations
+        )
+
+    def is_cleared(self) -> bool:
+        """Whether every current relation is already in the cleared (empty) state.
+
+        The dual of is_published(): returns True only if there is at least one
+        relation and no relation databag carries either configuration key. Callers
+        use this to deduplicate the empty state — once configuration has been
+        cleared, a later reconcile with the same (empty) result can skip calling
+        clear_configuration() again instead of repeating databag pops and secret
+        lookups on every event (spec 2.2).
+
+        Returns False when this unit is not the leader (a non-leader never writes
+        the databag, so it cannot assert the state).
+        """
+        if not self._charm.unit.is_leader():
+            return False
+        relations = self._charm.model.relations[self._relation_name]
+        if not relations:
+            return False
+        return all(
+            DATABAG_KEY_CONFIGURATION not in relation.data[self._charm.app]
+            and DATABAG_KEY_SECRET_URI not in relation.data[self._charm.app]
             for relation in relations
         )
 

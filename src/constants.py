@@ -22,6 +22,10 @@ GIT_SYNC_PASSWORD_FILE = "/git-creds/password"
 EXECHOOK_SCRIPT_PATH = "/usr/local/bin/notify-content-synced"
 # Pebble custom-notice key fired by the exechook when content changes.
 CONTENT_SYNCED_NOTICE_KEY = "canonical.com/airflow-provider-configurator/content-synced"
+# Timeout (seconds) for the one-time git-sync fetch triggered by the sync-now
+# action, so the action fails cleanly rather than hanging the hook on a slow or
+# unreachable repository.
+SYNC_NOW_TIMEOUT_SECONDS = 120
 
 # Config option keys.
 CONFIG_FILE_PATH = "airflow_provider_configurations_file_path"

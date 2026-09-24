@@ -424,27 +424,63 @@ class TestReconcile:
 
 
 class TestSyncNowAction:
-    def test_sync_now_publishes(self, context, synced_container):
-        """The sync-now action re-reads and republishes the configuration."""
+    def test_sync_now_publishes(self, context, tmp_path):
+        """The sync-now action forces a fetch then re-reads and republishes."""
         git_relation = _public_relation()
         provider_relation = _provider_relation()
+        # The action runs `git-sync --one-time` via exec; register a handler so
+        # the simulated exec succeeds (exit 0), mirroring the real fetch.
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        (repo_dir / "providers.ini").write_text(SAMPLE_INI)
+        synced = ops.testing.Container(
+            name="git-sync",
+            can_connect=True,
+            mounts={"content": ops.testing.Mount(location="/git/repo", source=repo_dir)},
+            execs={
+                ops.testing.Exec(["/bin/git-sync"], return_code=0),
+            },
+        )
         state = ops.testing.State(
             leader=True,
-            containers=[synced_container],
-            relations=[git_relation, provider_relation],
+            containers=[synced],
+            relations=[git_relation, provider_relation, _peer_relation()],
             config={FILE_PATH_CONFIG: "providers.ini"},
         )
         state_out = context.run(context.on.action("sync-now"), state)
         out_provider = state_out.get_relation(provider_relation.id)
         assert "provider-configuration" in out_provider.local_app_data
 
-    def test_sync_now_fails_when_file_missing(self, context, container):
-        """sync-now fails cleanly (not an unhandled traceback) if the file is missing."""
+    def test_sync_now_fails_when_fetch_errors(self, context, tmp_path):
+        """sync-now fails cleanly if the forced git-sync fetch returns non-zero."""
         git_relation = _public_relation()
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        (repo_dir / "providers.ini").write_text(SAMPLE_INI)
+        # Exec handler returns non-zero -> _one_time_sync raises -> action fails.
+        failing = ops.testing.Container(
+            name="git-sync",
+            can_connect=True,
+            mounts={"content": ops.testing.Mount(location="/git/repo", source=repo_dir)},
+            execs={
+                ops.testing.Exec(["/bin/git-sync"], return_code=1),
+            },
+        )
+        state = ops.testing.State(
+            leader=True,
+            containers=[failing],
+            relations=[git_relation, _provider_relation(), _peer_relation()],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        with pytest.raises(ops.testing.ActionFailed):
+            context.run(context.on.action("sync-now"), state)
+
+    def test_sync_now_fails_when_prerequisites_unmet(self, context, container):
+        """sync-now fails cleanly (not a traceback) when prerequisites are unmet."""
+        # No git relation -> _validate_prerequisites raises before any fetch.
         state = ops.testing.State(
             leader=True,
             containers=[container],
-            relations=[git_relation],
             config={FILE_PATH_CONFIG: "providers.ini"},
         )
         with pytest.raises(ops.testing.ActionFailed):
@@ -716,3 +752,65 @@ class TestEmptyConfigCleanup:
             mock_set.assert_called_once()
             mock_clear.assert_not_called()
         assert state_out.unit_status == ops.ActiveStatus()
+
+    def test_cleared_state_not_recleared_when_unchanged(self, context, empty_synced_container):
+        """Once cleared, an unchanged empty config must NOT re-run clear_configuration.
+
+        Regression for the review comment: is_cleared() lets the empty state be
+        deduplicated too, so a second reconcile with the same empty result skips
+        the clear instead of repeating it on every event (spec 2.2).
+        """
+        from unittest.mock import patch
+
+        git_relation = _public_relation()
+        # First reconcile: empty file with a stale stored hash -> clears + stores hash.
+        state = ops.testing.State(
+            leader=True,
+            containers=[empty_synced_container],
+            relations=[
+                git_relation,
+                _provider_relation(),
+                _peer_relation(local_app_data={charm_module.PEER_CONFIG_HASH_KEY: "stale"}),
+            ],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        state_after_first = context.run(context.on.relation_changed(git_relation), state)
+
+        # Second reconcile over the resulting state: hash now matches AND relations
+        # are already cleared, so clear_configuration must not be called again.
+        with patch("charm.AirflowProviderConfiguratorProvides.clear_configuration") as mock_clear:
+            context.run(context.on.update_status(), state_after_first)
+            mock_clear.assert_not_called()
+
+
+class TestSyncNowForce:
+    """sync-now bypasses the content-hash dedup (review: force republish)."""
+
+    def test_sync_now_republishes_even_when_unchanged(self, context, tmp_path):
+        """sync-now must publish even when the hash is unchanged (force=True)."""
+        from unittest.mock import patch
+
+        git_relation = _public_relation()
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        (repo_dir / "providers.ini").write_text(SAMPLE_INI)
+        synced = ops.testing.Container(
+            name="git-sync",
+            can_connect=True,
+            mounts={"content": ops.testing.Mount(location="/git/repo", source=repo_dir)},
+            execs={ops.testing.Exec(["/bin/git-sync"], return_code=0)},
+        )
+        # Pre-seed the peer hash so a normal reconcile would dedup and skip.
+        state = ops.testing.State(
+            leader=True,
+            containers=[synced],
+            relations=[git_relation, _provider_relation(), _peer_relation()],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        # First establish the published state + stored hash.
+        state = context.run(context.on.relation_changed(git_relation), state)
+
+        # Now sync-now: even though nothing changed, it must call set_configuration.
+        with patch("charm.AirflowProviderConfiguratorProvides.set_configuration") as mock_set:
+            context.run(context.on.action("sync-now"), state)
+            mock_set.assert_called_once()

@@ -47,6 +47,7 @@ from constants import (
     PEER_CONFIG_HASH_KEY,
     PEER_RELATION_NAME,
     SSH_NOT_SUPPORTED_MESSAGE,
+    SYNC_NOW_TIMEOUT_SECONDS,
     WAITING_FOR_CONTAINER_MESSAGE,
     WORKLOAD_CONTAINER,
 )
@@ -54,7 +55,7 @@ from constants import (
 logger = logging.getLogger(__name__)
 
 
-class ExceptionWithStatusError(Exception):
+class ExitWithStatusError(Exception):
     """Base class of exceptions for when a method has an opinion on the unit status."""
 
     def __init__(self, message: str, status_type):
@@ -142,7 +143,7 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         or two providers collide on the same section.option, the unit blocks.
 
         Raises:
-            ExceptionWithStatusError: if the secret is set but cannot be read or
+            ExitWithStatusError: if the secret is set but cannot be read or
                 parsed, or if a duplicate section.option is found (spec 3.3).
         """
         secret_id = self.config.get(CONFIG_SENSITIVE_SECRET)
@@ -152,7 +153,7 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
             secret = self.model.get_secret(id=str(secret_id))
             content = secret.get_content(refresh=True)
         except (ops.SecretNotFoundError, ops.ModelError) as e:
-            raise ExceptionWithStatusError(
+            raise ExitWithStatusError(
                 "Sensitive configuration secret is not accessible; "
                 "check it exists and is granted to this charm.",
                 ops.BlockedStatus,
@@ -164,9 +165,9 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
             sensitive_config.DuplicateSensitiveKeyError,
             sensitive_config.InvalidSensitiveConfigError,
         ) as e:
-            raise ExceptionWithStatusError(str(e), ops.BlockedStatus) from e
+            raise ExitWithStatusError(str(e), ops.BlockedStatus) from e
         except json.JSONDecodeError as e:
-            raise ExceptionWithStatusError(
+            raise ExitWithStatusError(
                 "Sensitive configuration secret payload is not valid JSON.",
                 ops.BlockedStatus,
             ) from e
@@ -177,7 +178,7 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         """Idempotent reconcile: configure git-sync and publish synced config."""
         try:
             self._validate_prerequisites()
-        except ExceptionWithStatusError as e:
+        except ExitWithStatusError as e:
             # Prerequisites not met (e.g. git relation removed): stop git-sync so
             # it doesn't keep polling a stale/unrelated repo, then report status.
             logger.error(e)
@@ -187,7 +188,7 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         try:
             self._configure_pebble_layer()
             self._publish_configuration()
-        except ExceptionWithStatusError as e:
+        except ExitWithStatusError as e:
             # Prerequisites are met and git-sync is configured; a later failure
             # (e.g. file not yet synced) should not stop git-sync, so it can pick
             # up the content once it appears.
@@ -200,19 +201,19 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         """Check required config, the git relation, and the container are ready.
 
         Raises:
-            ExceptionWithStatusError: if any prerequisite is not met.
+            ExitWithStatusError: if any prerequisite is not met.
         """
         if not self._file_path:
-            raise ExceptionWithStatusError(MISSING_FILE_PATH_MESSAGE, ops.BlockedStatus)
+            raise ExitWithStatusError(MISSING_FILE_PATH_MESSAGE, ops.BlockedStatus)
         if self.model.get_relation(GIT_RELATION_NAME) is None:
-            raise ExceptionWithStatusError(MISSING_GIT_RELATION_MESSAGE, ops.BlockedStatus)
+            raise ExitWithStatusError(MISSING_GIT_RELATION_MESSAGE, ops.BlockedStatus)
         git_info = self._git_connection_info()
         if git_info is None:
-            raise ExceptionWithStatusError(INVALID_GIT_RELATION_MESSAGE, ops.BlockedStatus)
+            raise ExitWithStatusError(INVALID_GIT_RELATION_MESSAGE, ops.BlockedStatus)
         if git_info.authentication_method == git.AuthenticationMethodEnum.SSH:
-            raise ExceptionWithStatusError(SSH_NOT_SUPPORTED_MESSAGE, ops.BlockedStatus)
+            raise ExitWithStatusError(SSH_NOT_SUPPORTED_MESSAGE, ops.BlockedStatus)
         if not self._container.can_connect():
-            raise ExceptionWithStatusError(WAITING_FOR_CONTAINER_MESSAGE, ops.WaitingStatus)
+            raise ExitWithStatusError(WAITING_FOR_CONTAINER_MESSAGE, ops.WaitingStatus)
 
     def _configure_pebble_layer(self) -> None:
         """Push git credentials and the exechook, then (re)configure git-sync."""
@@ -225,12 +226,22 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
                 permissions=0o755,
             )
         except ops.pebble.PathError as e:
-            raise ExceptionWithStatusError(
+            raise ExitWithStatusError(
                 "Failed to write the git-sync exechook to the workload container.",
                 ops.BlockedStatus,
             ) from e
+        # Only replan when the git-sync service definition actually changes.
+        # Every event (including update-status) reaches here, and an
+        # unconditional replan would repeatedly re-issue Pebble operations and
+        # risk disturbing the continuously running sync service for no reason.
+        # Compare the effective plan before and after applying the layer so the
+        # comparison uses Pebble's own normalized view rather than a hand-rolled
+        # diff of a raw layer against a combined plan.
+        services_before = self._container.get_plan().services
         self._container.add_layer(GIT_SYNC_SERVICE, self._git_sync_layer, combine=True)
-        self._container.replan()
+        services_after = self._container.get_plan().services
+        if services_before != services_after:
+            self._container.replan()
 
     def _stop_git_sync(self) -> None:
         """Stop the git-sync service so it doesn't keep polling a stale/unrelated repo.
@@ -247,7 +258,7 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
             self._container.stop(GIT_SYNC_SERVICE)
         self._container.remove_path(GIT_SYNC_PASSWORD_FILE, recursive=True)
 
-    def _publish_configuration(self) -> None:
+    def _publish_configuration(self, force: bool = False) -> None:
         """Read the synced .ini and publish it over the relation.
 
         Combines the non-sensitive .ini (synced from git) with the sensitive
@@ -263,8 +274,14 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         file that is present but empty, as distinct from an absent file (handled
         as BlockedStatus in _read_synced_file, spec 1.3).
 
+        Args:
+            force: when True, bypass the content-hash deduplication and always
+                (re)publish the current configuration. Used by the sync-now
+                action so an operator can force a republish on demand even when
+                the content is unchanged.
+
         Raises:
-            ExceptionWithStatusError: if the file is missing, or the sensitive
+            ExitWithStatusError: if the file is missing, or the sensitive
                 secret is set but unreadable / invalid / has a collision.
         """
         ini_content = self._read_synced_file()
@@ -274,15 +291,23 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         )
 
         config_hash = self._config_hash(template, flat_sensitive)
-        if config_hash == self._stored_config_hash and self._config_provider.is_published():
-            # Nothing changed since the last successful publish AND every current
-            # relation already carries the data: skip to avoid churning the
-            # relation databag and secret revisions. The is_published() check
-            # ensures a freshly-joined or re-added relation is still populated
-            # even when the content hash is unchanged (spec 1.2).
+        is_empty = not template and not flat_sensitive
+        # Skip when the content is unchanged AND the relations already reflect the
+        # desired state: for a non-empty config that means every relation carries
+        # the data (is_published); for an empty config it means every relation is
+        # already cleared (is_cleared). Checking the matching predicate keeps a
+        # freshly-joined relation from being stranded, and stops the empty state
+        # from re-running clear_configuration() on every event (spec 1.2, 2.2).
+        # force=True (the sync-now action) skips this dedup entirely.
+        already_reflected = (
+            self._config_provider.is_cleared()
+            if is_empty
+            else self._config_provider.is_published()
+        )
+        if not force and config_hash == self._stored_config_hash and already_reflected:
             return
 
-        if not template and not flat_sensitive:
+        if is_empty:
             # Both inputs empty (present-but-empty file and no sensitive data):
             # remove any previously published configuration (spec 2.2).
             self._config_provider.clear_configuration()
@@ -338,14 +363,14 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         honored (spec / review comment on the unused `path` field).
 
         Raises:
-            ExceptionWithStatusError: if the file does not exist (spec 1.3).
+            ExitWithStatusError: if the file does not exist (spec 1.3).
         """
         resolved_path = self._resolved_file_path
         full_path = f"{GIT_SYNC_ROOT}/{GIT_SYNC_DEST}/{resolved_path}"
         try:
             return self._container.pull(full_path, encoding="utf-8").read()
         except ops.pebble.PathError as e:
-            raise ExceptionWithStatusError(
+            raise ExitWithStatusError(
                 f"Configuration file not found at {resolved_path}; "
                 "check the repository and file path.",
                 ops.BlockedStatus,
@@ -372,7 +397,7 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         try:
             self._container.push(GIT_SYNC_PASSWORD_FILE, token, make_dirs=True, permissions=0o400)
         except ops.pebble.PathError as e:
-            raise ExceptionWithStatusError(
+            raise ExitWithStatusError(
                 "Failed to write git credentials to the workload container.",
                 ops.BlockedStatus,
             ) from e
@@ -390,7 +415,7 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         """Build the Pebble layer that runs git-sync in continuous poll mode."""
         git_info = self._git_connection_info()
         if git_info is None:
-            raise ExceptionWithStatusError(INVALID_GIT_RELATION_MESSAGE, ops.BlockedStatus)
+            raise ExitWithStatusError(INVALID_GIT_RELATION_MESSAGE, ops.BlockedStatus)
         service: ops.pebble.ServiceDict = {
             "override": "replace",
             "summary": "git-sync",
@@ -443,14 +468,85 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
             env["GITSYNC_PASSWORD_FILE"] = GIT_SYNC_PASSWORD_FILE
         return env
 
+    def _one_time_sync_command(self, git_info: git.GitProviderModel) -> list[str]:
+        """Build the git-sync command for a single, synchronous fetch.
+
+        Unlike the long-lived service command, this runs git-sync with
+        `--one-time` (fetch once and exit) and a `--timeout`, and omits
+        `--period` and `--exechook-command` (there is no continuous loop and no
+        notice to fire — the action republishes directly afterwards). It reuses
+        the same repo, root, link, ref and username, and the token still comes
+        from the password file via the service environment, so no credential
+        appears on the command line. Returns an argv list for container.exec.
+        """
+        parts = [
+            "/bin/git-sync",
+            f"--repo={git_info.repository_url}",
+            f"--root={GIT_SYNC_ROOT}",
+            f"--link={GIT_SYNC_DEST}",
+            "--one-time",
+            f"--timeout={SYNC_NOW_TIMEOUT_SECONDS}",
+        ]
+        if git_info.tracking_ref:
+            parts.append(f"--ref={git_info.tracking_ref}")
+        if git_info.credentials_username:
+            parts.append(f"--username={git_info.credentials_username}")
+        return parts
+
+    def _one_time_sync(self) -> None:
+        """Force git-sync to fetch from the remote once, synchronously.
+
+        Runs a second, short-lived `git-sync --one-time` in the workload
+        container and waits for it to finish, so the on-disk checkout is fresh
+        before the action republishes. This is safe to run alongside the
+        long-lived poller: git-sync serialises on the shared root and
+        `--one-time` exits cleanly whether or not there was new content.
+
+        Raises:
+            ExitWithStatusError: if the fetch fails or times out, so the action
+                reports a clear failure instead of claiming success.
+        """
+        git_info = self._git_connection_info()
+        if git_info is None:
+            raise ExitWithStatusError(INVALID_GIT_RELATION_MESSAGE, ops.BlockedStatus)
+        command = self._one_time_sync_command(git_info)
+        environment = self._git_sync_environment(git_info)
+        try:
+            process = self._container.exec(
+                command,
+                environment=environment or None,
+                timeout=SYNC_NOW_TIMEOUT_SECONDS + 30,
+            )
+            process.wait()
+        except ops.pebble.ExecError as e:
+            raise ExitWithStatusError(
+                f"Forced git-sync fetch failed (exit {e.exit_code}); "
+                "check the repository, ref, and credentials.",
+                ops.BlockedStatus,
+            ) from e
+        except ops.pebble.ChangeError as e:
+            raise ExitWithStatusError(
+                "Forced git-sync fetch did not complete in time.",
+                ops.BlockedStatus,
+            ) from e
+
     # ---- actions ----------------------------------------------------------
 
     def _on_sync_now_action(self, event: ops.ActionEvent) -> None:
-        """Force an immediate re-read and republish of the provider configuration."""
+        """Force an immediate git-sync fetch and republish, bypassing dedup.
+
+        Implements the sync-now action (spec 1.4.2.1): it drives git-sync to
+        fetch from the remote once and waits for that to finish (rather than
+        waiting for the poller's next `--period` tick), then republishes the
+        resulting configuration with dedup bypassed so the publish happens even
+        when the content is unchanged. Fails cleanly (no false "republished")
+        if prerequisites are unmet or the fetch fails.
+        """
         try:
             self._validate_prerequisites()
-            self._publish_configuration()
-        except ExceptionWithStatusError as e:
+            self._one_time_sync()
+            self._publish_configuration(force=True)
+        except ExitWithStatusError as e:
             event.fail(e.message)
             return
         event.set_results({"result": "Provider configuration republished."})
