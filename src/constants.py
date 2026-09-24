@@ -13,10 +13,15 @@ GIT_SYNC_DEST = "repo"
 # Private, root-only file holding the git PAT so it never appears on the command
 # line or in the service environment.
 GIT_SYNC_PASSWORD_FILE = "/git-creds/password"
+# Script git-sync runs (via --exechook-command) after each changed sync.
+EXECHOOK_SCRIPT_PATH = "/usr/local/bin/notify-content-synced"
+# Pebble custom-notice key fired by the exechook when content changes.
+CONTENT_SYNCED_NOTICE_KEY = "canonical.com/airflow-provider-configurator/content-synced"
 
 # Config option keys.
 CONFIG_FILE_PATH = "airflow_provider_configurations_file_path"
 CONFIG_SYNC_PERIOD = "airflow_provider_configurations_sync_period"
+CONFIG_SENSITIVE_SECRET = "airflow_provider_configurations_secret"
 
 # Status messages (centralised so tests can assert exact equality).
 MISSING_FILE_PATH_MESSAGE = f"Missing required config: {CONFIG_FILE_PATH}"
