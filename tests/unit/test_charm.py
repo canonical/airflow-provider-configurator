@@ -194,22 +194,23 @@ def _running_git_sync_container(repo_dir):
     )
 
 
-def _patch_sync_wait(monkeypatch, mtimes, timeout=None):
-    """Simulate git-sync's touch file while sync-now waits, without real sleeps.
+def _patch_sync_wait(monkeypatch, counts, timeout=None):
+    """Simulate git-sync's sync counter while sync-now waits, without real sleeps.
 
-    `mtimes` are returned in order by _sync_touch_file_mtime (the last value
-    repeats), so [1.0, 2.0] means "the sync completed" and [1.0] means "it never
-    did". `timeout` overrides the wait budget so the failure path is instant.
+    `counts` are (total, errors) pairs returned in order by _git_sync_counts (the
+    last value repeats), so [(1, 0), (2, 0)] means "the sync completed" and
+    [(1, 0)] means "it never did". `timeout` overrides the wait budget so the
+    failure path is instant.
     """
-    remaining = list(mtimes)
+    remaining = list(counts)
 
-    def fake_mtime(_self):
+    def fake_counts(_self):
         return remaining.pop(0) if len(remaining) > 1 else remaining[0]
 
     monkeypatch.setattr(
         charm_module.AirflowProviderConfiguratorCharm,
-        "_sync_touch_file_mtime",
-        fake_mtime,
+        "_git_sync_counts",
+        fake_counts,
     )
     monkeypatch.setattr(charm_module, "SYNC_NOW_POLL_INTERVAL_SECONDS", 0)
     if timeout is not None:
@@ -480,7 +481,7 @@ class TestSyncNowAction:
         repo_dir = tmp_path / "repo"
         repo_dir.mkdir()
         (repo_dir / "providers.ini").write_text(SAMPLE_INI)
-        _patch_sync_wait(monkeypatch, mtimes=[1.0, 2.0])
+        _patch_sync_wait(monkeypatch, counts=[(1.0, 0.0), (2.0, 0.0)])
         state = ops.testing.State(
             leader=True,
             containers=[_running_git_sync_container(repo_dir)],
@@ -515,12 +516,12 @@ class TestSyncNowAction:
     def test_sync_now_fails_when_sync_does_not_complete(
         self, context, tmp_path, monkeypatch
     ):
-        """sync-now fails if the touch file never updates within the timeout."""
+        """sync-now fails if the sync counter never advances within the timeout."""
         repo_dir = tmp_path / "repo"
         repo_dir.mkdir()
         (repo_dir / "providers.ini").write_text(SAMPLE_INI)
-        # Touch file never changes -> the wait loop expires -> action fails.
-        _patch_sync_wait(monkeypatch, mtimes=[1.0], timeout=0)
+        # Counter never advances -> the wait loop expires -> action fails.
+        _patch_sync_wait(monkeypatch, counts=[(1.0, 0.0)], timeout=0)
         state = ops.testing.State(
             leader=True,
             containers=[_running_git_sync_container(repo_dir)],
@@ -529,6 +530,40 @@ class TestSyncNowAction:
         )
         with pytest.raises(ops.testing.ActionFailed):
             context.run(context.on.action("sync-now"), state)
+
+    def test_sync_now_fails_when_fetch_errors(self, context, tmp_path, monkeypatch):
+        """sync-now fails when the sync it triggered errored, not just on timeout."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        (repo_dir / "providers.ini").write_text(SAMPLE_INI)
+        # The counter advances, but the increment is in the error bucket.
+        _patch_sync_wait(monkeypatch, counts=[(1.0, 0.0), (2.0, 1.0)])
+        state = ops.testing.State(
+            leader=True,
+            containers=[_running_git_sync_container(repo_dir)],
+            relations=[_public_relation(), _provider_relation(), _peer_relation()],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        with pytest.raises(ops.testing.ActionFailed) as excinfo:
+            context.run(context.on.action("sync-now"), state)
+        assert excinfo.value.message == charm_module.SYNC_NOW_FETCH_FAILED_MESSAGE
+
+    def test_sync_now_fails_when_git_sync_restarts(self, context, tmp_path, monkeypatch):
+        """A counter reset means git-sync died mid-sync, which is a failure."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        (repo_dir / "providers.ini").write_text(SAMPLE_INI)
+        # git-sync exits after a failed sync, so its counters restart from zero.
+        _patch_sync_wait(monkeypatch, counts=[(5.0, 0.0), (1.0, 0.0)])
+        state = ops.testing.State(
+            leader=True,
+            containers=[_running_git_sync_container(repo_dir)],
+            relations=[_public_relation(), _provider_relation(), _peer_relation()],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        with pytest.raises(ops.testing.ActionFailed) as excinfo:
+            context.run(context.on.action("sync-now"), state)
+        assert excinfo.value.message == charm_module.SYNC_NOW_FETCH_FAILED_MESSAGE
 
     def test_sync_now_fails_when_prerequisites_unmet(self, context, container):
         """sync-now fails cleanly (not a traceback) when prerequisites are unmet."""
@@ -540,6 +575,81 @@ class TestSyncNowAction:
         )
         with pytest.raises(ops.testing.ActionFailed):
             context.run(context.on.action("sync-now"), state)
+
+
+class TestGitSyncCounts:
+    """Parsing of git-sync's Prometheus counter, which signals sync completion."""
+
+    @staticmethod
+    def _patch_endpoint(monkeypatch, *, status=200, payload="", error=None):
+        """Stand in for git-sync's metrics endpoint."""
+
+        class FakeResponse:
+            def __init__(self):
+                self.status = status
+
+            def read(self):
+                return payload.encode()
+
+        class FakeConnection:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def request(self, *args, **kwargs):
+                if error is not None:
+                    raise error
+
+            def getresponse(self):
+                return FakeResponse()
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(charm_module.http.client, "HTTPConnection", FakeConnection)
+
+    def test_unchanged_sync_counts_towards_total(self, context, container, monkeypatch):
+        """A 'noop' sync must be counted: it is how an unchanged repo reports success.
+
+        Regression test for using --touch-file as the completion signal. git-sync
+        only touches that file when the content changed, so sync-now against an
+        unchanged repository waited for the full timeout and falsely reported
+        failure.
+        """
+        self._patch_endpoint(
+            monkeypatch,
+            payload=(
+                "# HELP git_sync_count_total How many git syncs completed\n"
+                "# TYPE git_sync_count_total counter\n"
+                'git_sync_count_total{status="success"} 2\n'
+                'git_sync_count_total{status="noop"} 3\n'
+            ),
+        )
+        with context(context.on.update_status(), ops.testing.State(containers=[container])) as mgr:
+            assert mgr.charm._git_sync_counts() == (5.0, 0.0)
+
+    def test_errors_are_reported_separately(self, context, container, monkeypatch):
+        """Failed syncs are counted so sync-now can report a fetch failure."""
+        self._patch_endpoint(
+            monkeypatch,
+            payload=(
+                'git_sync_count_total{status="success"} 1\n'
+                'git_sync_count_total{status="error"} 4\n'
+            ),
+        )
+        with context(context.on.update_status(), ops.testing.State(containers=[container])) as mgr:
+            assert mgr.charm._git_sync_counts() == (5.0, 4.0)
+
+    def test_unreachable_endpoint_returns_none(self, context, container, monkeypatch):
+        """An unreadable endpoint is inconclusive, not a completed sync."""
+        self._patch_endpoint(monkeypatch, error=OSError("connection refused"))
+        with context(context.on.update_status(), ops.testing.State(containers=[container])) as mgr:
+            assert mgr.charm._git_sync_counts() is None
+
+    def test_non_200_returns_none(self, context, container, monkeypatch):
+        """Same for an endpoint that responds but not with metrics."""
+        self._patch_endpoint(monkeypatch, status=503, payload="repo is not ready")
+        with context(context.on.update_status(), ops.testing.State(containers=[container])) as mgr:
+            assert mgr.charm._git_sync_counts() is None
 
 
 class TestSensitiveData:
@@ -930,7 +1040,7 @@ class TestSyncNowForce:
         state = context.run(context.on.relation_changed(git_relation), state)
 
         # Now sync-now: even though nothing changed, it must call set_configuration.
-        _patch_sync_wait(monkeypatch, mtimes=[1.0, 2.0])
+        _patch_sync_wait(monkeypatch, counts=[(1.0, 0.0), (2.0, 0.0)])
         with patch("charm.AirflowProviderConfiguratorProvides.set_configuration") as mock_set:
             context.run(context.on.action("sync-now"), state)
             mock_set.assert_called_once()

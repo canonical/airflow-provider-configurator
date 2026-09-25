@@ -22,20 +22,37 @@ GIT_SYNC_PASSWORD_FILE = "/git-creds/password"
 EXECHOOK_SCRIPT_PATH = "/usr/local/bin/notify-content-synced"
 # Pebble custom-notice key fired by the exechook when content changes.
 CONTENT_SYNCED_NOTICE_KEY = "canonical.com/airflow-provider-configurator/content-synced"
-# File git-sync touches (via --touch-file) after every completed sync, whether or
-# not the content changed. The sync-now action watches its modification time to
-# know that the sync it triggered has finished.
-GIT_SYNC_TOUCH_FILE = "/git/.sync-complete"
 # Signal git-sync listens on (via --sync-on-signal) to run a sync immediately
 # instead of waiting for the next --period tick. Used by the sync-now action so
 # the already-running poller does the fetch: starting a second git-sync against
 # the same --root is unsafe, because git-sync empties its root on startup.
 GIT_SYNC_SIGNAL = "SIGHUP"
+
+# git-sync's Prometheus endpoint (enabled with --http-bind/--http-metrics), used
+# by the sync-now action to tell when the sync it triggered has finished.
+#
+# --touch-file is deliberately NOT used for this. Despite git-sync's manual
+# describing it as touched "whenever a sync completes", its source only touches
+# it when the synced content actually changed, so an unchanged repository (the
+# common case) would never signal completion. The git_sync_count_total counter
+# is incremented once per completed sync attempt in all three outcomes
+# (success, noop, error), which is what the action actually needs to observe.
+#
+# Bound to loopback so the metrics are reachable from the charm container (which
+# shares the pod's network namespace) without being exposed outside the pod.
+GIT_SYNC_METRICS_HOST = "127.0.0.1"
+GIT_SYNC_METRICS_PORT = 9148
+GIT_SYNC_METRICS_PATH = "/metrics"
+# How long (seconds) to wait on a single read of the metrics endpoint.
+GIT_SYNC_METRICS_TIMEOUT_SECONDS = 5
+# Counter metric, labelled by outcome: success, noop or error.
+GIT_SYNC_COUNT_METRIC = "git_sync_count_total"
+
 # How long (seconds) the sync-now action waits for the signalled sync to finish
 # before failing, so the action fails cleanly rather than hanging the hook on a
 # slow or unreachable repository.
 SYNC_NOW_TIMEOUT_SECONDS = 120
-# How long (seconds) to wait between checks of the touch file while waiting.
+# How long (seconds) to wait between checks of the sync counter while waiting.
 SYNC_NOW_POLL_INTERVAL_SECONDS = 1
 
 # Config option keys.
@@ -57,3 +74,7 @@ MISSING_SENSITIVE_KEY_MESSAGE = (
 )
 SYNC_NOW_NOT_RUNNING_MESSAGE = "git-sync is not running; cannot force a sync"
 SYNC_NOW_TIMEOUT_MESSAGE = "Forced git-sync did not complete in time"
+SYNC_NOW_FETCH_FAILED_MESSAGE = (
+    "Forced git-sync failed to fetch from the repository; "
+    "check the git-sync logs and the repository configuration"
+)

@@ -19,8 +19,10 @@ publishes the configuration.
 """
 
 import hashlib
+import http.client
 import json
 import logging
+import re
 import shlex
 import time
 from pathlib import PurePosixPath
@@ -38,12 +40,16 @@ from constants import (
     CONTENT_SYNCED_NOTICE_KEY,
     EXECHOOK_SCRIPT_PATH,
     GIT_RELATION_NAME,
+    GIT_SYNC_COUNT_METRIC,
     GIT_SYNC_DEST,
+    GIT_SYNC_METRICS_HOST,
+    GIT_SYNC_METRICS_PATH,
+    GIT_SYNC_METRICS_PORT,
+    GIT_SYNC_METRICS_TIMEOUT_SECONDS,
     GIT_SYNC_PASSWORD_FILE,
     GIT_SYNC_ROOT,
     GIT_SYNC_SERVICE,
     GIT_SYNC_SIGNAL,
-    GIT_SYNC_TOUCH_FILE,
     INVALID_GIT_RELATION_MESSAGE,
     MISSING_FILE_PATH_MESSAGE,
     MISSING_GIT_RELATION_MESSAGE,
@@ -51,6 +57,7 @@ from constants import (
     PEER_CONFIG_HASH_KEY,
     PEER_RELATION_NAME,
     SSH_NOT_SUPPORTED_MESSAGE,
+    SYNC_NOW_FETCH_FAILED_MESSAGE,
     SYNC_NOW_NOT_RUNNING_MESSAGE,
     SYNC_NOW_POLL_INTERVAL_SECONDS,
     SYNC_NOW_TIMEOUT_MESSAGE,
@@ -495,11 +502,11 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         list. Arguments are joined with shlex.join so a relation value containing
         whitespace cannot inject extra flags.
 
-        `--sync-on-signal` and `--touch-file` exist for the sync-now action: the
-        signal makes this already-running process sync immediately instead of
-        waiting for the next `--period` tick, and the touch file (updated after
-        every completed sync, changed content or not) lets the action detect that
-        the sync it asked for has finished.
+        `--sync-on-signal` and the metrics endpoint exist for the sync-now
+        action: the signal makes this already-running process sync immediately
+        instead of waiting for the next `--period` tick, and the counter exposed
+        at `--http-bind` lets the action detect that the sync it asked for has
+        finished (see _git_sync_counts for why `--touch-file` is unsuitable).
         """
         parts = [
             "/bin/git-sync",
@@ -509,7 +516,8 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
             f"--period={self._sync_period}",
             f"--exechook-command={EXECHOOK_SCRIPT_PATH}",
             f"--sync-on-signal={GIT_SYNC_SIGNAL}",
-            f"--touch-file={GIT_SYNC_TOUCH_FILE}",
+            f"--http-bind={GIT_SYNC_METRICS_HOST}:{GIT_SYNC_METRICS_PORT}",
+            "--http-metrics",
         ]
         if git_info.tracking_ref:
             parts.append(f"--ref={git_info.tracking_ref}")
@@ -529,18 +537,57 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
             env["GITSYNC_PASSWORD_FILE"] = GIT_SYNC_PASSWORD_FILE
         return env
 
-    def _sync_touch_file_mtime(self) -> float | None:
-        """Modification time of git-sync's touch file, or None if absent.
+    def _git_sync_counts(self) -> tuple[float, float] | None:
+        """Completed git-sync attempts so far, as (total, errors).
 
-        git-sync updates this file after every completed sync, so a change in the
-        timestamp means the sync finished. Returns None when the file does not
-        exist yet (no sync has completed since the service last started).
+        Reads git-sync's Prometheus endpoint and sums `git_sync_count_total`,
+        which is incremented once per completed sync attempt and labelled with
+        the outcome: `success` (content changed), `noop` (content unchanged) or
+        `error` (the fetch failed).
+
+        This is used instead of `--touch-file` because git-sync only touches
+        that file when the content changed -- despite its manual describing it
+        as touched "whenever a sync completes" -- so a sync of an unchanged
+        repository would never be observable. The same limitation applies to the
+        exechook, which is why it cannot be reused here either.
+
+        Returns:
+            (total, errors), or None if the endpoint could not be read (for
+            example git-sync is starting up or has died).
         """
+        connection = http.client.HTTPConnection(
+            GIT_SYNC_METRICS_HOST,
+            GIT_SYNC_METRICS_PORT,
+            timeout=GIT_SYNC_METRICS_TIMEOUT_SECONDS,
+        )
         try:
-            files = self._container.list_files(GIT_SYNC_TOUCH_FILE)
-        except (ops.pebble.APIError, ops.pebble.PathError):
+            connection.request("GET", GIT_SYNC_METRICS_PATH)
+            response = connection.getresponse()
+            if response.status != 200:
+                return None
+            payload = response.read().decode("utf-8", errors="replace")
+        except (OSError, http.client.HTTPException):
             return None
-        return files[0].last_modified.timestamp() if files else None
+        finally:
+            connection.close()
+
+        total = errors = 0.0
+        pattern = re.compile(
+            rf'^{re.escape(GIT_SYNC_COUNT_METRIC)}\{{status="(?P<status>[^"]*)"\}}\s+'
+            r"(?P<value>[0-9.eE+-]+)\s*$"
+        )
+        for line in payload.splitlines():
+            match = pattern.match(line.strip())
+            if not match:
+                continue
+            try:
+                value = float(match["value"])
+            except ValueError:
+                continue
+            total += value
+            if match["status"] == "error":
+                errors += value
+        return total, errors
 
     def _trigger_sync(self) -> None:
         """Make the running git-sync fetch from the remote now, and wait for it.
@@ -548,16 +595,17 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         Sends `--sync-on-signal`'s signal to the existing git-sync service rather
         than starting a second git-sync process: git-sync empties its `--root` on
         startup, so a concurrent one-time run against the same root could destroy
-        the poller's working state. After signalling, this waits for the touch
-        file's timestamp to change, which git-sync updates once the sync
-        completes (whether or not the content changed).
+        the poller's working state. After signalling, this waits for git-sync's
+        completed-sync counter to advance, which happens whether or not the
+        content changed.
 
         Raises:
-            ExitWithStatusError: if git-sync is not running, or the sync does not
-                complete within SYNC_NOW_TIMEOUT_SECONDS, so the action reports a
-                clear failure instead of claiming success.
+            ExitWithStatusError: if git-sync is not running, if the sync it
+                performed failed, or if the sync does not complete within
+                SYNC_NOW_TIMEOUT_SECONDS, so the action reports a clear failure
+                instead of claiming success.
         """
-        before = self._sync_touch_file_mtime()
+        before_total, before_errors = self._git_sync_counts() or (0.0, 0.0)
         try:
             self._container.send_signal(GIT_SYNC_SIGNAL, GIT_SYNC_SERVICE)
         except (ops.pebble.APIError, ops.ModelError) as e:
@@ -566,7 +614,19 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         deadline = time.monotonic() + SYNC_NOW_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
             time.sleep(SYNC_NOW_POLL_INTERVAL_SECONDS)
-            if self._sync_touch_file_mtime() != before:
+            counts = self._git_sync_counts()
+            if counts is None:
+                # Endpoint momentarily unavailable; keep waiting until the
+                # deadline rather than reporting a failure we cannot confirm.
+                continue
+            total, errors = counts
+            if total < before_total:
+                # Counters only reset when the process restarted, which git-sync
+                # does after a failed sync (it exits once --max-failures is hit).
+                raise ExitWithStatusError(SYNC_NOW_FETCH_FAILED_MESSAGE, ops.BlockedStatus)
+            if total > before_total:
+                if errors > before_errors:
+                    raise ExitWithStatusError(SYNC_NOW_FETCH_FAILED_MESSAGE, ops.BlockedStatus)
                 return
         raise ExitWithStatusError(SYNC_NOW_TIMEOUT_MESSAGE, ops.BlockedStatus)
 
