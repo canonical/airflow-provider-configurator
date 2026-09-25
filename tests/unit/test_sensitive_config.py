@@ -82,6 +82,16 @@ class TestParseSensitiveConfig:
         with pytest.raises(InvalidSensitiveConfigError, match="provider -> section"):
             parse_sensitive_config(json.dumps(["not", "an", "object"]))
 
+    def test_null_payload_raises(self):
+        """`null` parses as valid JSON but is not a mapping.
+
+        Distinct from the empty payload above: "" and "{}" mean "no sensitive
+        configuration" and are accepted, whereas an explicit null is a malformed
+        payload and must block rather than silently becoming an empty config.
+        """
+        with pytest.raises(InvalidSensitiveConfigError, match="provider -> section"):
+            parse_sensitive_config("null")
+
     def test_provider_not_mapping_raises(self):
         """A provider that does not map to an object is malformed."""
         with pytest.raises(InvalidSensitiveConfigError, match="section -> option"):
