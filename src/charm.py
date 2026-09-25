@@ -106,7 +106,6 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
             self.on.config_changed,
             self.on.update_status,
             self.on.upgrade_charm,
-            self.on.secret_changed,
             self.on[WORKLOAD_CONTAINER].pebble_ready,
             self.on[WORKLOAD_CONTAINER].pebble_custom_notice,
             self.on[GIT_RELATION_NAME].relation_changed,
@@ -119,6 +118,7 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         ):
             self.framework.observe(event, self._reconcile)
 
+        self.framework.observe(self.on.secret_changed, self._on_secret_changed)
         self.framework.observe(self.on.sync_now_action, self._on_sync_now_action)
 
     # ---- config accessors -------------------------------------------------
@@ -127,6 +127,12 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
     def _file_path(self) -> str | None:
         """The configured path to the provider .ini file, or None if unset."""
         value = self.config.get(CONFIG_FILE_PATH)
+        return str(value) if value else None
+
+    @property
+    def _sensitive_secret_id(self) -> str | None:
+        """The configured user-secret id holding sensitive values, or None if unset."""
+        value = self.config.get(CONFIG_SENSITIVE_SECRET)
         return str(value) if value else None
 
     @property
@@ -167,11 +173,11 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
             ExitWithStatusError: if the secret is set but cannot be read or
                 parsed, or if a duplicate section.option is found (spec 3.3).
         """
-        secret_id = self.config.get(CONFIG_SENSITIVE_SECRET)
+        secret_id = self._sensitive_secret_id
         if not secret_id:
             return {}
         try:
-            secret = self.model.get_secret(id=str(secret_id))
+            secret = self.model.get_secret(id=secret_id)
             content = secret.get_content(refresh=True)
         except (ops.SecretNotFoundError, ops.ModelError) as e:
             raise ExitWithStatusError(
@@ -201,7 +207,7 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
 
     # ---- reconcile --------------------------------------------------------
 
-    def _reconcile(self, _: ops.EventBase) -> None:
+    def _reconcile(self, _: ops.EventBase, *, force_publish: bool = False) -> None:
         """Idempotent reconcile: configure git-sync and publish synced config."""
         try:
             self._validate_prerequisites()
@@ -221,7 +227,7 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
             return
         try:
             self._configure_pebble_layer()
-            self._publish_configuration()
+            self._publish_configuration(force=force_publish)
         except ExitWithStatusError as e:
             # Prerequisites are met and git-sync is configured; a later failure
             # (e.g. file not yet synced) should not stop git-sync, so it can pick
@@ -230,6 +236,17 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
             self.unit.status = e.status
             return
         self.unit.status = ops.ActiveStatus()
+
+    def _on_secret_changed(self, event: ops.SecretChangedEvent) -> None:
+        """Reconcile, forcing the publish past the content-hash dedup.
+
+        A new revision of the user secret can carry different sensitive values
+        under exactly the same options, which leaves the config hash identical
+        (see _config_hash for why the values are not part of it). This event is
+        the only indication that those values moved, so it must not be deduped
+        away or the coordinator would keep rendering the superseded revision.
+        """
+        self._reconcile(event, force_publish=True)
 
     def _config_source_removed(self) -> bool:
         """Whether the configuration source itself is gone, not just unavailable.
@@ -345,7 +362,7 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
             ini_content, sensitive_data=sensitive_data
         )
 
-        config_hash = self._config_hash(template, flat_sensitive)
+        config_hash = self._config_hash(template, self._sensitive_secret_id)
         is_empty = not template and not flat_sensitive
         # Skip when the content is unchanged AND the relations already reflect the
         # desired state: for a non-empty config that means every relation carries
@@ -374,15 +391,29 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         self._store_config_hash(config_hash)
 
     @staticmethod
-    def _config_hash(template: str, flat_sensitive: dict[str, str]) -> str:
+    def _config_hash(template: str, sensitive_secret_id: str | None) -> str:
         """Return a stable hash of the publishable configuration.
 
-        Hashes the derived (template, sensitive map) rather than the raw .ini so
-        the hash also changes when only the sensitive secret changes; the sole
-        purpose is deciding whether a republish is needed (spec 1.2). Keys are
-        sorted so the hash is independent of dict ordering.
+        Covers the rendered template and the identity of the secret supplying the
+        sensitive values; its sole purpose is deciding whether a republish is
+        needed (spec 1.2). Keys are sorted so the hash is independent of dict
+        ordering.
+
+        The sensitive values themselves are deliberately excluded. This hash goes
+        into the peer databag, which `juju show-unit` exposes to anyone with
+        model access, and although a digest cannot be reversed it can be
+        confirmed: a short or predictable value can be guessed, hashed and
+        compared. The template is enough to notice a change in *which* options
+        are sensitive, because every key in the sensitive map has a matching
+        `{{ ... }}` placeholder in it, and the secret id covers the option being
+        repointed at a different secret. The one change left over -- a new
+        revision of the same secret -- cannot be seen here at all, because Juju
+        only lets a secret's owner read its revision and this charm is merely an
+        observer of it; _on_secret_changed handles that case instead.
         """
-        payload = json.dumps({"template": template, "sensitive": flat_sensitive}, sort_keys=True)
+        payload = json.dumps(
+            {"template": template, "sensitive-secret-id": sensitive_secret_id}, sort_keys=True
+        )
         return hashlib.sha256(payload.encode()).hexdigest()
 
     @property

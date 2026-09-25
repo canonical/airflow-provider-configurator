@@ -3,6 +3,7 @@
 
 """Tests for the Airflow Provider Configurator charm (git input path)."""
 
+import hashlib
 import json
 import shlex
 
@@ -924,6 +925,81 @@ class TestConfigHashDedup:
         state_out = context.run(context.on.relation_joined(provider_relation), state)
         out_provider = state_out.get_relation(provider_relation.id)
         assert "provider-configuration" in out_provider.local_app_data
+
+    def test_stored_hash_does_not_expose_sensitive_values(self, context, synced_container):
+        """The peer-databag hash must not be a digest of the sensitive values.
+
+        `juju show-unit` exposes the peer databag, and a digest of a short or
+        predictable secret can be confirmed by guessing it. Two states differing
+        only in the value behind the same option must therefore hash the same;
+        the accompanying secret-changed test is what keeps that safe.
+        """
+
+        def hash_for(value):
+            user_secret = ops.testing.Secret(
+                {SENSITIVE_CONFIG_KEY: json.dumps({"p": {"gcs": {"conn_id": value}}})},
+                # Pinned so both runs point at the same secret: the id is part of
+                # the hash, and only the value behind it may differ here.
+                id="secret:ck1f0p3mp25c77tkdn1g",
+            )
+            git_relation = _public_relation()
+            state = ops.testing.State(
+                leader=True,
+                containers=[synced_container],
+                relations=[git_relation, _provider_relation(), _peer_relation()],
+                secrets=[user_secret],
+                config={
+                    FILE_PATH_CONFIG: "providers.ini",
+                    SENSITIVE_SECRET_CONFIG: user_secret.id,
+                },
+            )
+            state_out = context.run(context.on.relation_changed(git_relation), state)
+            peer = state_out.get_relation(
+                next(r.id for r in state_out.relations if r.endpoint == "replicas")
+            )
+            return peer.local_app_data[charm_module.PEER_CONFIG_HASH_KEY]
+
+        secret_value = "sup3r-s3cret"
+        stored = hash_for(secret_value)
+        assert stored == hash_for("something-completely-different")
+        # Nor is the value recoverable by hashing a guess the same way the charm does.
+        assert hashlib.sha256(secret_value.encode()).hexdigest() not in stored
+
+    def test_secret_changed_republishes_despite_unchanged_hash(self, context, synced_container):
+        """A new secret revision must publish even though the hash cannot see it.
+
+        The values are excluded from the hash, so a revision that keeps the same
+        options leaves it identical. Without this event forcing past the dedup,
+        the coordinator would keep rendering the superseded revision.
+        """
+        from unittest.mock import patch
+
+        user_secret = ops.testing.Secret(
+            {SENSITIVE_CONFIG_KEY: json.dumps({"p": {"gcs": {"conn_id": "old"}}})}
+        )
+        state = ops.testing.State(
+            leader=True,
+            containers=[synced_container],
+            relations=[_public_relation(), _provider_relation(), _peer_relation()],
+            secrets=[user_secret],
+            config={
+                FILE_PATH_CONFIG: "providers.ini",
+                SENSITIVE_SECRET_CONFIG: user_secret.id,
+            },
+        )
+        # Publish once so the hash is stored and the relation already carries the data.
+        state_after_first = context.run(context.on.update_status(), state)
+
+        # An ordinary event now dedups away, proving the hash really does match...
+        with patch("charm.AirflowProviderConfiguratorProvides.set_configuration") as mock_set:
+            context.run(context.on.update_status(), state_after_first)
+            mock_set.assert_not_called()
+
+        # ...while secret-changed still republishes.
+        changed_secret = state_after_first.get_secret(id=user_secret.id)
+        with patch("charm.AirflowProviderConfiguratorProvides.set_configuration") as mock_set:
+            context.run(context.on.secret_changed(changed_secret), state_after_first)
+            mock_set.assert_called_once()
 
 
 class TestEmptyConfigCleanup:
