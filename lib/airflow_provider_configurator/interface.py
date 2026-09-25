@@ -215,15 +215,20 @@ class AirflowProviderConfiguratorProvides(ops.Object):
         The steps run in reverse order of set_configuration: the databag keys are
         cleared first (so a requirer reading mid-transition never sees a secret URI
         pointing at an already-removed secret), then the secret is revoked and
-        removed. No-op if there is no relation or if this unit is not the leader;
-        safe to call when nothing was ever published (the secret simply won't
-        exist).
+        removed. No-op if this unit is not the leader; safe to call when nothing was
+        ever published (the secret simply won't exist).
+
+        There is deliberately no early return when there are no relations. The
+        charm secret is owned by the application and keyed by a fixed label, not
+        scoped to a relation, so it outlives the relation that prompted its
+        creation: returning early would leave the sensitive values sitting in the
+        model until the application itself is removed. The databag and revoke loops
+        are naturally no-ops on an empty relation list, so the secret removal below
+        still runs.
         """
         if not self._charm.unit.is_leader():
             return
         relations = self._charm.model.relations[self._relation_name]
-        if not relations:
-            return
 
         for relation in relations:
             databag = relation.data[self._charm.app]

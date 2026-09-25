@@ -138,6 +138,26 @@ class TestProvides:
         assert "provider-configuration" not in out_relation.local_app_data
         assert not state_out.secrets
 
+    def test_clear_configuration_removes_secret_when_relation_is_gone(self, provider_context):
+        """The orphaned charm secret is removed even after the relation disappears.
+
+        The charm secret is application-owned and keyed by a fixed label, so it
+        survives removal of the relation that caused it to be created. Clearing
+        must still delete it, otherwise the sensitive values linger in the model
+        until the application itself is removed.
+        """
+        secret = ops.testing.Secret(
+            tracked_content={"sensitive-data": json.dumps(SAMPLE_SENSITIVE)},
+            label="provider-configuration-charm-secret",
+            owner="app",
+        )
+        state = ops.testing.State(leader=True, relations=[], secrets=[secret])
+        with provider_context(provider_context.on.update_status(), state) as manager:
+            manager.charm.provider.clear_configuration()
+            state_out = manager.run()
+
+        assert not state_out.secrets
+
     def test_is_published_true_when_all_relations_carry_data(self, provider_context, relation):
         """is_published() is True once every relation databag holds the config keys."""
         state = ops.testing.State(leader=True, relations=[relation])
