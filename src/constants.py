@@ -65,6 +65,10 @@ CONFIG_SENSITIVE_SECRET = "airflow_provider_configurations_secret"
 
 # Status messages (centralised so tests can assert exact equality).
 MISSING_FILE_PATH_MESSAGE = f"Missing required config: {CONFIG_FILE_PATH}"
+ESCAPING_FILE_PATH_MESSAGE = (
+    "Configuration file path must stay inside the repository checkout: it must "
+    "be relative and must not contain '..' components"
+)
 MISSING_GIT_RELATION_MESSAGE = (
     "Missing git relation; relate to a git provider (e.g. git-integrator)"
 )

@@ -320,6 +320,75 @@ class TestReconcile:
         assert isinstance(state_out.unit_status, ops.BlockedStatus)
         assert "custom/sub/providers.ini" in state_out.unit_status.message
 
+    def test_blocked_when_file_path_escapes_the_checkout(
+        self, context, synced_container, pat_secret
+    ):
+        """A `..` in the configured file path is rejected instead of read.
+
+        The resolved path is handed straight to Pebble, so without this check the
+        charm would read an arbitrary file out of the workload container and
+        publish it to the coordinator. GIT_SYNC_PASSWORD_FILE is the obvious
+        target: `/git/repo/` + `../../git-creds/password` is exactly the file the
+        git PAT is written to.
+        """
+        relation = _credentials_relation(pat_secret)
+        provider_relation = _provider_relation()
+        state = ops.testing.State(
+            leader=True,
+            containers=[synced_container],
+            relations=[relation, provider_relation],
+            secrets=[pat_secret],
+            config={FILE_PATH_CONFIG: "../../git-creds/password"},
+        )
+        state_out = context.run(context.on.relation_changed(relation), state)
+
+        assert state_out.unit_status == ops.BlockedStatus(
+            charm_module.ESCAPING_FILE_PATH_MESSAGE
+        )
+        # Nothing was published, so the credential never reached the coordinator.
+        out_provider = state_out.get_relation(provider_relation.id)
+        assert "provider-configuration" not in out_provider.local_app_data
+
+    def test_blocked_when_relation_path_escapes_the_checkout(self, context, synced_container):
+        """A `..` in the git relation's `path` is rejected too.
+
+        Unlike the file path config, this value comes from another charm rather
+        than from this charm's operator, so it is the less trusted of the two.
+        """
+        git_relation = ops.testing.Relation(
+            GIT_RELATION,
+            interface="git",
+            remote_app_data={
+                "repository-url": "https://github.com/example/provider-config",
+                "tracking-ref": "main",
+                "path": "../../git-creds",
+            },
+        )
+        state = ops.testing.State(
+            leader=True,
+            containers=[synced_container],
+            relations=[git_relation, _provider_relation()],
+            config={FILE_PATH_CONFIG: "password"},
+        )
+        state_out = context.run(context.on.relation_changed(git_relation), state)
+        assert state_out.unit_status == ops.BlockedStatus(
+            charm_module.ESCAPING_FILE_PATH_MESSAGE
+        )
+
+    def test_blocked_when_file_path_is_absolute(self, context, synced_container):
+        """An absolute file path is rejected rather than silently re-anchored."""
+        git_relation = _public_relation()
+        state = ops.testing.State(
+            leader=True,
+            containers=[synced_container],
+            relations=[git_relation, _provider_relation()],
+            config={FILE_PATH_CONFIG: "/etc/passwd"},
+        )
+        state_out = context.run(context.on.relation_changed(git_relation), state)
+        assert state_out.unit_status == ops.BlockedStatus(
+            charm_module.ESCAPING_FILE_PATH_MESSAGE
+        )
+
     def test_https_auth_sets_username_and_writes_password_file(
         self, context, synced_container, pat_secret
     ):

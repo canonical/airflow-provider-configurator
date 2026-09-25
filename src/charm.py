@@ -38,6 +38,7 @@ from constants import (
     CONFIG_SENSITIVE_SECRET,
     CONFIG_SYNC_PERIOD,
     CONTENT_SYNCED_NOTICE_KEY,
+    ESCAPING_FILE_PATH_MESSAGE,
     EXECHOOK_SCRIPT_PATH,
     GIT_RELATION_NAME,
     GIT_SYNC_COUNT_METRIC,
@@ -144,10 +145,27 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         checks the whole repo out under GIT_SYNC_ROOT/GIT_SYNC_DEST, so `path`
         only matters at read time — the configured file is resolved relative to
         that subdirectory when one is advertised.
+
+        Both values are rejected unless they are relative and free of `..`
+        components, which is what keeps the result inside the checkout. The
+        resolved path is handed to Pebble as-is, so an escaping value would make
+        the charm read an arbitrary file out of the workload container and
+        publish its contents to the coordinator — GIT_SYNC_PASSWORD_FILE being
+        the obvious target. Note the relation `path` is supplied by another
+        charm, not by this charm's operator.
+
+        Raises:
+            ExitWithStatusError: if either value would escape the checkout.
         """
         file_path = self._file_path or ""
         git_info = self._git_connection_info()
         subdir = (git_info.path if git_info else None) or ""
+        for value in (subdir, file_path):
+            if not value:
+                continue
+            candidate = PurePosixPath(value)
+            if candidate.is_absolute() or ".." in candidate.parts:
+                raise ExitWithStatusError(ESCAPING_FILE_PATH_MESSAGE, ops.BlockedStatus)
         return str(PurePosixPath(subdir) / file_path) if subdir else file_path
 
     def _git_connection_info(self) -> git.GitProviderModel | None:
