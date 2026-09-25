@@ -167,6 +167,55 @@ def _subdir_relation():
     )
 
 
+def _running_git_sync_container(repo_dir):
+    """A container whose git-sync service is in the plan and active.
+
+    sync-now signals the running service, so the service must exist and be
+    running for the signal to be delivered.
+    """
+    return ops.testing.Container(
+        name="git-sync",
+        can_connect=True,
+        mounts={"content": ops.testing.Mount(location="/git/repo", source=repo_dir)},
+        layers={
+            "git-sync": ops.pebble.Layer(
+                {
+                    "services": {
+                        "git-sync": {
+                            "override": "replace",
+                            "command": "/bin/git-sync",
+                            "startup": "enabled",
+                        }
+                    }
+                }
+            )
+        },
+        service_statuses={"git-sync": ops.pebble.ServiceStatus.ACTIVE},
+    )
+
+
+def _patch_sync_wait(monkeypatch, mtimes, timeout=None):
+    """Simulate git-sync's touch file while sync-now waits, without real sleeps.
+
+    `mtimes` are returned in order by _sync_touch_file_mtime (the last value
+    repeats), so [1.0, 2.0] means "the sync completed" and [1.0] means "it never
+    did". `timeout` overrides the wait budget so the failure path is instant.
+    """
+    remaining = list(mtimes)
+
+    def fake_mtime(_self):
+        return remaining.pop(0) if len(remaining) > 1 else remaining[0]
+
+    monkeypatch.setattr(
+        charm_module.AirflowProviderConfiguratorCharm,
+        "_sync_touch_file_mtime",
+        fake_mtime,
+    )
+    monkeypatch.setattr(charm_module, "SYNC_NOW_POLL_INTERVAL_SECONDS", 0)
+    if timeout is not None:
+        monkeypatch.setattr(charm_module, "SYNC_NOW_TIMEOUT_SECONDS", timeout)
+
+
 class TestReconcile:
     def test_blocked_without_file_path(self, context, container):
         """No file_path config -> BlockedStatus."""
@@ -424,26 +473,17 @@ class TestReconcile:
 
 
 class TestSyncNowAction:
-    def test_sync_now_publishes(self, context, tmp_path):
-        """The sync-now action forces a fetch then re-reads and republishes."""
+    def test_sync_now_publishes(self, context, tmp_path, monkeypatch):
+        """The sync-now action signals git-sync, waits, then republishes."""
         git_relation = _public_relation()
         provider_relation = _provider_relation()
-        # The action runs `git-sync --one-time` via exec; register a handler so
-        # the simulated exec succeeds (exit 0), mirroring the real fetch.
         repo_dir = tmp_path / "repo"
         repo_dir.mkdir()
         (repo_dir / "providers.ini").write_text(SAMPLE_INI)
-        synced = ops.testing.Container(
-            name="git-sync",
-            can_connect=True,
-            mounts={"content": ops.testing.Mount(location="/git/repo", source=repo_dir)},
-            execs={
-                ops.testing.Exec(["/bin/git-sync"], return_code=0),
-            },
-        )
+        _patch_sync_wait(monkeypatch, mtimes=[1.0, 2.0])
         state = ops.testing.State(
             leader=True,
-            containers=[synced],
+            containers=[_running_git_sync_container(repo_dir)],
             relations=[git_relation, provider_relation, _peer_relation()],
             config={FILE_PATH_CONFIG: "providers.ini"},
         )
@@ -451,25 +491,40 @@ class TestSyncNowAction:
         out_provider = state_out.get_relation(provider_relation.id)
         assert "provider-configuration" in out_provider.local_app_data
 
-    def test_sync_now_fails_when_fetch_errors(self, context, tmp_path):
-        """sync-now fails cleanly if the forced git-sync fetch returns non-zero."""
-        git_relation = _public_relation()
+    def test_sync_now_fails_when_service_not_running(self, context, tmp_path):
+        """sync-now fails cleanly when git-sync is not running to be signalled."""
         repo_dir = tmp_path / "repo"
         repo_dir.mkdir()
         (repo_dir / "providers.ini").write_text(SAMPLE_INI)
-        # Exec handler returns non-zero -> _one_time_sync raises -> action fails.
-        failing = ops.testing.Container(
+        # No git-sync layer in the plan -> send_signal raises -> action fails
+        # rather than falsely reporting a republish.
+        not_running = ops.testing.Container(
             name="git-sync",
             can_connect=True,
             mounts={"content": ops.testing.Mount(location="/git/repo", source=repo_dir)},
-            execs={
-                ops.testing.Exec(["/bin/git-sync"], return_code=1),
-            },
         )
         state = ops.testing.State(
             leader=True,
-            containers=[failing],
-            relations=[git_relation, _provider_relation(), _peer_relation()],
+            containers=[not_running],
+            relations=[_public_relation(), _provider_relation(), _peer_relation()],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        with pytest.raises(ops.testing.ActionFailed):
+            context.run(context.on.action("sync-now"), state)
+
+    def test_sync_now_fails_when_sync_does_not_complete(
+        self, context, tmp_path, monkeypatch
+    ):
+        """sync-now fails if the touch file never updates within the timeout."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        (repo_dir / "providers.ini").write_text(SAMPLE_INI)
+        # Touch file never changes -> the wait loop expires -> action fails.
+        _patch_sync_wait(monkeypatch, mtimes=[1.0], timeout=0)
+        state = ops.testing.State(
+            leader=True,
+            containers=[_running_git_sync_container(repo_dir)],
+            relations=[_public_relation(), _provider_relation(), _peer_relation()],
             config={FILE_PATH_CONFIG: "providers.ini"},
         )
         with pytest.raises(ops.testing.ActionFailed):
@@ -559,6 +614,25 @@ class TestSensitiveData:
                 SENSITIVE_SECRET_CONFIG: ungranted.id,
             },
             # note: ungranted is intentionally NOT in secrets=[...]
+        )
+        state_out = context.run(context.on.relation_changed(git_relation), state)
+        assert isinstance(state_out.unit_status, ops.BlockedStatus)
+
+    def test_blocked_when_sensitive_secret_missing_payload_key(self, context, synced_container):
+        """Secret exists but lacks the payload key -> BlockedStatus, not silently empty."""
+        # A secret with the wrong key is an operator mistake; treating it as "no
+        # sensitive data" would silently drop the values they intended to set.
+        wrong_key = ops.testing.Secret({"wrong-key": json.dumps({"a": {"b": {"c": "d"}}})})
+        git_relation = _public_relation()
+        state = ops.testing.State(
+            leader=True,
+            containers=[synced_container],
+            relations=[git_relation, _provider_relation()],
+            secrets=[wrong_key],
+            config={
+                FILE_PATH_CONFIG: "providers.ini",
+                SENSITIVE_SECRET_CONFIG: wrong_key.id,
+            },
         )
         state_out = context.run(context.on.relation_changed(git_relation), state)
         assert isinstance(state_out.unit_status, ops.BlockedStatus)
@@ -783,10 +857,60 @@ class TestEmptyConfigCleanup:
             mock_clear.assert_not_called()
 
 
+class TestConfigSourceRemoved:
+    """The published config is withdrawn when its source goes away (spec 2.2, 4.2)."""
+
+    def test_published_config_cleared_when_git_relation_removed(self, context, synced_container):
+        """Removing the git relation empties the databag so the coordinator reconfigures."""
+        git_relation = _public_relation()
+        provider_relation = _provider_relation()
+        state = ops.testing.State(
+            leader=True,
+            containers=[synced_container],
+            relations=[git_relation, provider_relation, _peer_relation()],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        published = context.run(context.on.relation_changed(git_relation), state)
+        out_provider = published.get_relation(provider_relation.id)
+        assert "provider-configuration" in out_provider.local_app_data
+
+        # Drop the git relation and reconcile: the config we published can no
+        # longer be refreshed, so it must be withdrawn immediately.
+        without_git = ops.testing.State(
+            leader=True,
+            containers=list(published.containers),
+            relations=[r for r in published.relations if r.endpoint != GIT_RELATION],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        state_out = context.run(context.on.update_status(), without_git)
+        out_provider = state_out.get_relation(provider_relation.id)
+        assert "provider-configuration" not in out_provider.local_app_data
+        assert "provider-configuration-secret-uri" not in out_provider.local_app_data
+        # The stored hash is dropped too, so a re-added source republishes.
+        out_peer = next(r for r in state_out.relations if r.endpoint == "replicas")
+        assert charm_module.PEER_CONFIG_HASH_KEY not in out_peer.local_app_data
+
+    def test_published_config_kept_when_container_not_ready(self, context):
+        """A transient wait (container down) must not withdraw a valid config."""
+        from unittest.mock import patch
+
+        unreachable = ops.testing.Container(name="git-sync", can_connect=False)
+        state = ops.testing.State(
+            leader=True,
+            containers=[unreachable],
+            relations=[_public_relation(), _provider_relation(), _peer_relation()],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        with patch("charm.AirflowProviderConfiguratorProvides.clear_configuration") as mock_clear:
+            state_out = context.run(context.on.update_status(), state)
+            mock_clear.assert_not_called()
+        assert isinstance(state_out.unit_status, ops.WaitingStatus)
+
+
 class TestSyncNowForce:
     """sync-now bypasses the content-hash dedup (review: force republish)."""
 
-    def test_sync_now_republishes_even_when_unchanged(self, context, tmp_path):
+    def test_sync_now_republishes_even_when_unchanged(self, context, tmp_path, monkeypatch):
         """sync-now must publish even when the hash is unchanged (force=True)."""
         from unittest.mock import patch
 
@@ -794,12 +918,7 @@ class TestSyncNowForce:
         repo_dir = tmp_path / "repo"
         repo_dir.mkdir()
         (repo_dir / "providers.ini").write_text(SAMPLE_INI)
-        synced = ops.testing.Container(
-            name="git-sync",
-            can_connect=True,
-            mounts={"content": ops.testing.Mount(location="/git/repo", source=repo_dir)},
-            execs={ops.testing.Exec(["/bin/git-sync"], return_code=0)},
-        )
+        synced = _running_git_sync_container(repo_dir)
         # Pre-seed the peer hash so a normal reconcile would dedup and skip.
         state = ops.testing.State(
             leader=True,
@@ -811,6 +930,7 @@ class TestSyncNowForce:
         state = context.run(context.on.relation_changed(git_relation), state)
 
         # Now sync-now: even though nothing changed, it must call set_configuration.
+        _patch_sync_wait(monkeypatch, mtimes=[1.0, 2.0])
         with patch("charm.AirflowProviderConfiguratorProvides.set_configuration") as mock_set:
             context.run(context.on.action("sync-now"), state)
             mock_set.assert_called_once()
