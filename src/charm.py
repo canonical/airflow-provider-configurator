@@ -56,6 +56,7 @@ from constants import (
     MISSING_SENSITIVE_KEY_MESSAGE,
     PEER_CONFIG_HASH_KEY,
     PEER_RELATION_NAME,
+    PROVIDER_RELATION_NAME,
     SSH_NOT_SUPPORTED_MESSAGE,
     SYNC_NOW_FETCH_FAILED_MESSAGE,
     SYNC_NOW_NOT_RUNNING_MESSAGE,
@@ -109,6 +110,12 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
             self.on[WORKLOAD_CONTAINER].pebble_ready,
             self.on[WORKLOAD_CONTAINER].pebble_custom_notice,
             self.on[GIT_RELATION_NAME].relation_changed,
+            # A consumer that has just joined has an empty databag, so it must be
+            # served here: the content hash is unchanged from the last publish, so
+            # without this event nothing would write to the new relation until an
+            # unrelated event (at worst the next update-status) happened to
+            # reconcile.
+            self.on[PROVIDER_RELATION_NAME].relation_joined,
         ):
             self.framework.observe(event, self._reconcile)
 
@@ -438,6 +445,30 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
 
     # ---- git-sync layer ---------------------------------------------------
 
+    @staticmethod
+    def _https_credentials(git_info: git.GitProviderModel | None) -> tuple[str, str] | None:
+        """The (username, token) pair for HTTPS auth, or None if it is incomplete.
+
+        git-sync refuses to start at all when it is given one half of the pair
+        ("invalid flag: --password-file may only be specified when --username is
+        specified"), so the two values have to be applied together or not at all.
+
+        They do arrive apart in practice. The git integrator library only blanks
+        the fields belonging to the authentication method that is *not* in use,
+        and it blanks a token to the placeholder string "None" rather than to a
+        falsy value, so a relation using SSH -- or one whose authentication
+        method is not set yet -- can report a truthy token with no username.
+        Requiring both here keeps those states from building a layer that git-sync
+        rejects, which would otherwise fail the hook and leave the unit in error.
+        """
+        if git_info is None:
+            return None
+        username = git_info.credentials_username
+        token = git_info.credentials_personal_access_token
+        if not username or not token:
+            return None
+        return username, token
+
     def _push_git_credentials(self) -> None:
         """Write the git PAT to a private file read by git-sync.
 
@@ -445,15 +476,15 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         git-sync via GITSYNC_PASSWORD_FILE, so it appears neither on the command
         line nor in the service environment.
 
-        When no token is available (e.g. the relation dropped its credentials or
-        the token was rotated to empty), any previously written credentials file
-        is removed so a stale secret does not linger in the container.
+        When no usable token is available (e.g. the relation dropped its
+        credentials or switched to SSH) any previously written credentials file is
+        removed so a stale secret does not linger in the container.
         """
-        git_info = self._git_connection_info()
-        token = git_info.credentials_personal_access_token if git_info else None
-        if not token:
+        credentials = self._https_credentials(self._git_connection_info())
+        if credentials is None:
             self._container.remove_path(GIT_SYNC_PASSWORD_FILE, recursive=True)
             return
+        _, token = credentials
         try:
             self._container.push(GIT_SYNC_PASSWORD_FILE, token, make_dirs=True, permissions=0o400)
         except ops.pebble.PathError as e:
@@ -521,8 +552,9 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         ]
         if git_info.tracking_ref:
             parts.append(f"--ref={git_info.tracking_ref}")
-        if git_info.credentials_username:
-            parts.append(f"--username={git_info.credentials_username}")
+        credentials = self._https_credentials(git_info)
+        if credentials is not None:
+            parts.append(f"--username={credentials[0]}")
         return shlex.join(parts)
 
     def _git_sync_environment(self, git_info: git.GitProviderModel) -> dict[str, str]:
@@ -530,10 +562,11 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
 
         The personal access token is referenced via GITSYNC_PASSWORD_FILE (a
         root-only file) rather than an inline value, so it is not exposed in the
-        process list or the service environment.
+        process list or the service environment. It is only set alongside the
+        matching `--username`, which git-sync requires (see _https_credentials).
         """
         env: dict[str, str] = {}
-        if git_info.credentials_personal_access_token:
+        if self._https_credentials(git_info) is not None:
             env["GITSYNC_PASSWORD_FILE"] = GIT_SYNC_PASSWORD_FILE
         return env
 

@@ -4,14 +4,27 @@
 """Tests for the sensitive provider configuration parser."""
 
 import json
+import re
 
 import pytest
 
 from sensitive_config import (
+    SENSITIVE_CONFIG_SECRET_KEY,
     DuplicateSensitiveKeyError,
     InvalidSensitiveConfigError,
     parse_sensitive_config,
 )
+
+
+def test_secret_key_is_creatable_in_juju():
+    """The payload key must be one `juju add-secret` will actually accept.
+
+    Juju restricts secret keys to lowercase alphanumerics separated by hyphens
+    and rejects underscores outright, so a key spelled with underscores cannot
+    be supplied by an operator at all and would leave the charm permanently
+    blocked on a secret nobody can create.
+    """
+    assert re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", SENSITIVE_CONFIG_SECRET_KEY)
 
 
 class TestParseSensitiveConfig:

@@ -5,6 +5,9 @@
 
 # Relations and workload.
 GIT_RELATION_NAME = "remote-airflow-provider-configurations"
+# Relation over which the provider configuration is published to consumers
+# (the airflow-coordinator charm).
+PROVIDER_RELATION_NAME = "airflow-provider-configuration"
 # Peer relation used to store the hash of the last published configuration, so
 # republishing is skipped when nothing changed (spec 1.2).
 PEER_RELATION_NAME = "replicas"
@@ -70,7 +73,7 @@ SSH_NOT_SUPPORTED_MESSAGE = "SSH authentication is not supported yet; use HTTPS 
 WAITING_FOR_CONTAINER_MESSAGE = "Waiting for the git-sync container"
 MISSING_SENSITIVE_KEY_MESSAGE = (
     "Sensitive configuration secret is missing the "
-    "'airflow_provider_configurations' key"
+    "'airflow-provider-configurations' key"
 )
 SYNC_NOW_NOT_RUNNING_MESSAGE = "git-sync is not running; cannot force a sync"
 SYNC_NOW_TIMEOUT_MESSAGE = "Forced git-sync did not complete in time"

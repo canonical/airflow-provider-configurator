@@ -19,7 +19,7 @@ PROVIDER_RELATION = "airflow-provider-configuration"
 FILE_PATH_CONFIG = "airflow_provider_configurations_file_path"
 
 SENSITIVE_SECRET_CONFIG = "airflow_provider_configurations_secret"
-SENSITIVE_CONFIG_KEY = "airflow_provider_configurations"
+SENSITIVE_CONFIG_KEY = "airflow-provider-configurations"
 
 # The secret content key git-integrator uses for the PAT.
 PAT_SECRET_KEY = "credentials-personal-access-token"
@@ -350,6 +350,46 @@ class TestReconcile:
         container_root = out_container.get_filesystem(context)
         password_file = container_root / charm_module.GIT_SYNC_PASSWORD_FILE.lstrip("/")
         assert password_file.read_text() == "custom-personal-access-token"
+
+    def test_token_without_username_does_not_configure_auth(
+        self, context, synced_container, pat_secret
+    ):
+        """A token with no username must not reach git-sync at all.
+
+        git-sync exits immediately on `--password-file` without `--username`, so
+        a layer built from half a credential pair puts the unit in error. The
+        integrator library produces exactly that shape whenever the relation's
+        authentication method is unset: it leaves the token populated (as the
+        placeholder "None") while never supplying a username.
+        """
+        relation = ops.testing.Relation(
+            GIT_RELATION,
+            interface="git",
+            remote_app_data={
+                "repository-url": "https://github.com/example/provider-config",
+                "tracking-ref": "main",
+                "secret-credentials-personal-access-token": pat_secret.id,
+            },
+        )
+        state = ops.testing.State(
+            leader=True,
+            containers=[synced_container],
+            relations=[relation, _provider_relation()],
+            secrets=[pat_secret],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        state_out = context.run(context.on.relation_changed(relation), state)
+
+        assert state_out.unit_status == ops.ActiveStatus()
+        out_container = state_out.get_container("git-sync")
+        service = out_container.layers["git-sync"].services["git-sync"]
+        assert "--username" not in service.command
+        assert "GITSYNC_PASSWORD_FILE" not in (service.environment or {})
+
+        # No half-usable credential is left behind in the container either.
+        container_root = out_container.get_filesystem(context)
+        password_file = container_root / charm_module.GIT_SYNC_PASSWORD_FILE.lstrip("/")
+        assert not password_file.exists()
 
     def test_command_is_injection_safe(self, context, container):
         """A relation value containing whitespace must not inject extra git-sync flags."""
@@ -864,6 +904,26 @@ class TestConfigHashDedup:
         with patch("charm.AirflowProviderConfiguratorProvides.set_configuration") as mock_set:
             context.run(context.on.relation_changed(git_relation), state_readded)
             mock_set.assert_called_once()
+
+    def test_relation_joined_publishes_to_the_new_consumer(self, context, synced_container):
+        """Joining the provider relation is itself enough to get the data published.
+
+        The dedup escape hatch above is only reachable if some hook actually runs
+        when a consumer joins. Driving the consumer's own relation-joined event
+        here (rather than an unrelated one) is what proves that endpoint is
+        observed; otherwise a new consumer stays empty until an unrelated event
+        happens to reconcile.
+        """
+        provider_relation = _provider_relation()
+        state = ops.testing.State(
+            leader=True,
+            containers=[synced_container],
+            relations=[_public_relation(), provider_relation, _peer_relation()],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        state_out = context.run(context.on.relation_joined(provider_relation), state)
+        out_provider = state_out.get_relation(provider_relation.id)
+        assert "provider-configuration" in out_provider.local_app_data
 
 
 class TestEmptyConfigCleanup:
