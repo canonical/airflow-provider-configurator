@@ -204,6 +204,93 @@ class AirflowProviderConfiguratorProvides(ops.Object):
             databag[DATABAG_KEY_CONFIGURATION] = provider_configuration
             databag[DATABAG_KEY_SECRET_URI] = secret.id
 
+    def clear_configuration(self) -> None:
+        """Remove any published provider configuration and revoke the charm secret.
+
+        Reverses set_configuration: clears the relation databag keys, then revokes
+        and removes the charm secret holding the sensitive data. Used when the
+        provider configuration becomes empty (spec 2.2), so the coordinator stops
+        rendering stale provider config into airflow.cfg.
+
+        The steps run in reverse order of set_configuration: the databag keys are
+        cleared first (so a requirer reading mid-transition never sees a secret URI
+        pointing at an already-removed secret), then the secret is revoked and
+        removed. No-op if this unit is not the leader; safe to call when nothing was
+        ever published (the secret simply won't exist).
+
+        There is deliberately no early return when there are no relations. The
+        charm secret is owned by the application and keyed by a fixed label, not
+        scoped to a relation, so it outlives the relation that prompted its
+        creation: returning early would leave the sensitive values sitting in the
+        model until the application itself is removed. The databag and revoke loops
+        are naturally no-ops on an empty relation list, so the secret removal below
+        still runs.
+        """
+        if not self._charm.unit.is_leader():
+            return
+        relations = self._charm.model.relations[self._relation_name]
+
+        for relation in relations:
+            databag = relation.data[self._charm.app]
+            databag.pop(DATABAG_KEY_CONFIGURATION, None)
+            databag.pop(DATABAG_KEY_SECRET_URI, None)
+
+        try:
+            secret = self._charm.model.get_secret(label=CHARM_PROVIDER_CONFIG_SECRET_LABEL)
+        except ops.SecretNotFoundError:
+            # Nothing was ever published (or it's already been cleared): idempotent.
+            return
+        for relation in relations:
+            secret.revoke(relation)
+        secret.remove_all_revisions()
+
+    def is_published(self) -> bool:
+        """Whether every current relation already carries the published configuration.
+
+        Returns True only if there is at least one relation and every relation
+        databag holds both the configuration template and the secret URI. Callers
+        use this together with the content hash: a hash may be unchanged, but a
+        freshly-joined (or re-added) relation still needs the data written, so a
+        content-only dedup must not skip the publish while this returns False.
+
+        Returns False when this unit is not the leader (a non-leader never writes
+        the databag, so it cannot assert the data is published).
+        """
+        if not self._charm.unit.is_leader():
+            return False
+        relations = self._charm.model.relations[self._relation_name]
+        if not relations:
+            return False
+        return all(
+            DATABAG_KEY_CONFIGURATION in relation.data[self._charm.app]
+            and DATABAG_KEY_SECRET_URI in relation.data[self._charm.app]
+            for relation in relations
+        )
+
+    def is_cleared(self) -> bool:
+        """Whether every current relation is already in the cleared (empty) state.
+
+        The dual of is_published(): returns True only if there is at least one
+        relation and no relation databag carries either configuration key. Callers
+        use this to deduplicate the empty state — once configuration has been
+        cleared, a later reconcile with the same (empty) result can skip calling
+        clear_configuration() again instead of repeating databag pops and secret
+        lookups on every event (spec 2.2).
+
+        Returns False when this unit is not the leader (a non-leader never writes
+        the databag, so it cannot assert the state).
+        """
+        if not self._charm.unit.is_leader():
+            return False
+        relations = self._charm.model.relations[self._relation_name]
+        if not relations:
+            return False
+        return all(
+            DATABAG_KEY_CONFIGURATION not in relation.data[self._charm.app]
+            and DATABAG_KEY_SECRET_URI not in relation.data[self._charm.app]
+            for relation in relations
+        )
+
 
 class AirflowProviderConfiguratorRequires(ops.Object):
     """Requirer side of the airflow_provider_configuration relation.

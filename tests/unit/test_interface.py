@@ -93,6 +93,156 @@ class TestProvides:
             "sensitive-data": json.dumps(SAMPLE_SENSITIVE)
         }
 
+    def test_clear_configuration_empties_databag_and_removes_secret(
+        self, provider_context, relation
+    ):
+        """clear_configuration removes the databag keys and the charm secret."""
+        state = ops.testing.State(leader=True, relations=[relation])
+        with provider_context(provider_context.on.relation_changed(relation), state) as manager:
+            # Publish first, so there is something to clear.
+            manager.charm.provider.set_configuration(
+                provider_configuration=SAMPLE_TEMPLATE,
+                provider_configuration_sensitive_data=SAMPLE_SENSITIVE,
+            )
+            # Then clear it.
+            manager.charm.provider.clear_configuration()
+            state_out = manager.run()
+
+        out_relation = state_out.get_relation(relation.id)
+        assert "provider-configuration" not in out_relation.local_app_data
+        assert "provider-configuration-secret-uri" not in out_relation.local_app_data
+        # The charm secret is gone (all revisions removed).
+        assert not state_out.secrets
+
+    def test_clear_configuration_noop_when_not_leader(self, provider_context, relation):
+        """clear_configuration is a no-op on a non-leader unit."""
+        state = ops.testing.State(leader=False, relations=[relation])
+        with provider_context(provider_context.on.relation_changed(relation), state) as manager:
+            manager.charm.provider.clear_configuration()
+            state_out = manager.run()
+
+        out_relation = state_out.get_relation(relation.id)
+        assert "provider-configuration" not in out_relation.local_app_data
+
+    def test_clear_configuration_idempotent_when_nothing_published(
+        self, provider_context, relation
+    ):
+        """Clearing when nothing was ever published is safe (no secret to remove)."""
+        state = ops.testing.State(leader=True, relations=[relation])
+        with provider_context(provider_context.on.relation_changed(relation), state) as manager:
+            # No prior set_configuration: the charm secret does not exist.
+            manager.charm.provider.clear_configuration()
+            state_out = manager.run()
+
+        out_relation = state_out.get_relation(relation.id)
+        assert "provider-configuration" not in out_relation.local_app_data
+        assert not state_out.secrets
+
+    def test_clear_configuration_removes_secret_when_relation_is_gone(self, provider_context):
+        """The orphaned charm secret is removed even after the relation disappears.
+
+        The charm secret is application-owned and keyed by a fixed label, so it
+        survives removal of the relation that caused it to be created. Clearing
+        must still delete it, otherwise the sensitive values linger in the model
+        until the application itself is removed.
+        """
+        secret = ops.testing.Secret(
+            tracked_content={"sensitive-data": json.dumps(SAMPLE_SENSITIVE)},
+            label="provider-configuration-charm-secret",
+            owner="app",
+        )
+        state = ops.testing.State(leader=True, relations=[], secrets=[secret])
+        with provider_context(provider_context.on.update_status(), state) as manager:
+            manager.charm.provider.clear_configuration()
+            state_out = manager.run()
+
+        assert not state_out.secrets
+
+    def test_is_published_true_when_all_relations_carry_data(self, provider_context, relation):
+        """is_published() is True once every relation databag holds the config keys."""
+        state = ops.testing.State(leader=True, relations=[relation])
+        with provider_context(provider_context.on.relation_changed(relation), state) as manager:
+            manager.charm.provider.set_configuration(
+                provider_configuration=SAMPLE_TEMPLATE,
+                provider_configuration_sensitive_data=SAMPLE_SENSITIVE,
+            )
+            assert manager.charm.provider.is_published() is True
+            manager.run()
+
+    def test_is_published_false_when_a_relation_is_empty(self, provider_context, relation):
+        """A freshly-joined (empty) relation makes is_published() False.
+
+        Even with another relation already published, an empty databag on any
+        relation means the publish must not be skipped (regression for the
+        content-hash dedup stranding a re-added relation).
+        """
+        fresh = ops.testing.Relation(RELATION_NAME, interface=RELATION_INTERFACE)
+        state = ops.testing.State(leader=True, relations=[relation, fresh])
+        with provider_context(provider_context.on.relation_changed(relation), state) as manager:
+            # Publish only reaches both relations, but assert the pre-publish state
+            # first: nothing written yet -> not published.
+            assert manager.charm.provider.is_published() is False
+            manager.run()
+
+    def test_is_published_false_when_not_leader(self, provider_context, relation):
+        """A non-leader never writes the databag, so it reports not published."""
+        state = ops.testing.State(leader=False, relations=[relation])
+        with provider_context(provider_context.on.relation_changed(relation), state) as manager:
+            assert manager.charm.provider.is_published() is False
+            manager.run()
+
+    def test_is_published_false_when_no_relation(self, provider_context):
+        """No relation at all -> not published."""
+        state = ops.testing.State(leader=True, relations=[])
+        with provider_context(provider_context.on.update_status(), state) as manager:
+            assert manager.charm.provider.is_published() is False
+            manager.run()
+
+    def test_is_cleared_true_when_relation_has_no_keys(self, provider_context, relation):
+        """A relation that carries neither config key is in the cleared state."""
+        state = ops.testing.State(leader=True, relations=[relation])
+        with provider_context(provider_context.on.relation_changed(relation), state) as manager:
+            # Nothing published yet -> cleared.
+            assert manager.charm.provider.is_cleared() is True
+            manager.run()
+
+    def test_is_cleared_false_after_publish(self, provider_context, relation):
+        """Once configuration is published, the relation is no longer cleared."""
+        state = ops.testing.State(leader=True, relations=[relation])
+        with provider_context(provider_context.on.relation_changed(relation), state) as manager:
+            manager.charm.provider.set_configuration(
+                provider_configuration=SAMPLE_TEMPLATE,
+                provider_configuration_sensitive_data=SAMPLE_SENSITIVE,
+            )
+            assert manager.charm.provider.is_cleared() is False
+            manager.run()
+
+    def test_is_cleared_true_after_clear(self, provider_context, relation):
+        """After clear_configuration, the relation reports cleared again."""
+        state = ops.testing.State(leader=True, relations=[relation])
+        with provider_context(provider_context.on.relation_changed(relation), state) as manager:
+            manager.charm.provider.set_configuration(
+                provider_configuration=SAMPLE_TEMPLATE,
+                provider_configuration_sensitive_data=SAMPLE_SENSITIVE,
+            )
+            manager.charm.provider.clear_configuration()
+            assert manager.charm.provider.is_cleared() is True
+            manager.run()
+
+    def test_is_cleared_false_when_not_leader(self, provider_context, relation):
+        """A non-leader cannot assert the cleared state."""
+        state = ops.testing.State(leader=False, relations=[relation])
+        with provider_context(provider_context.on.relation_changed(relation), state) as manager:
+            assert manager.charm.provider.is_cleared() is False
+            manager.run()
+
+    def test_is_cleared_false_when_no_relation(self, provider_context):
+        """No relation at all -> not cleared (there is nothing to be cleared)."""
+        state = ops.testing.State(leader=True, relations=[])
+        with provider_context(provider_context.on.update_status(), state) as manager:
+            assert manager.charm.provider.is_cleared() is False
+            manager.run()
+
 
 class TestRequires:
     def _remote_data_with_secret(self):
