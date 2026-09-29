@@ -602,13 +602,25 @@ class TestSyncNowAction:
         out_provider = state_out.get_relation(provider_relation.id)
         assert "provider-configuration" in out_provider.local_app_data
 
-    def test_sync_now_fails_when_service_not_running(self, context, tmp_path):
-        """sync-now fails cleanly when git-sync is not running to be signalled."""
+    def test_sync_now_fails_when_service_not_running(
+        self, context, tmp_path, monkeypatch
+    ):
+        """sync-now fails cleanly when git-sync is not running to be signalled.
+
+        The action reconciles before signalling, which normally configures and
+        starts git-sync itself, so layer configuration is stubbed out here to
+        leave the service genuinely absent. That isolates the guarantee under
+        test: an undeliverable signal fails the action instead of falsely
+        reporting a republish.
+        """
         repo_dir = tmp_path / "repo"
         repo_dir.mkdir()
         (repo_dir / "providers.ini").write_text(SAMPLE_INI)
-        # No git-sync layer in the plan -> send_signal raises -> action fails
-        # rather than falsely reporting a republish.
+        monkeypatch.setattr(
+            charm_module.AirflowProviderConfiguratorCharm,
+            "_configure_pebble_layer",
+            lambda _self: None,
+        )
         not_running = ops.testing.Container(
             name="git-sync",
             can_connect=True,
@@ -620,8 +632,9 @@ class TestSyncNowAction:
             relations=[_public_relation(), _provider_relation(), _peer_relation()],
             config={FILE_PATH_CONFIG: "providers.ini"},
         )
-        with pytest.raises(ops.testing.ActionFailed):
+        with pytest.raises(ops.testing.ActionFailed) as excinfo:
             context.run(context.on.action("sync-now"), state)
+        assert excinfo.value.message == charm_module.SYNC_NOW_NOT_RUNNING_MESSAGE
 
     def test_sync_now_fails_when_sync_does_not_complete(
         self, context, tmp_path, monkeypatch
@@ -685,6 +698,73 @@ class TestSyncNowAction:
         )
         with pytest.raises(ops.testing.ActionFailed):
             context.run(context.on.action("sync-now"), state)
+
+    def test_sync_now_configures_git_sync_before_signalling(
+        self, context, tmp_path, monkeypatch
+    ):
+        """The action reconciles, so it configures git-sync rather than assuming it.
+
+        The action routes through `_reconcile` precisely so it cannot drift from
+        the event-driven path. Starting from a container with no layer proves the
+        configuration step really runs: a forced fetch must be sent to git-sync as
+        currently configured (repo, ref, credentials), not to whatever it happened
+        to be started with earlier.
+        """
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        (repo_dir / "providers.ini").write_text(SAMPLE_INI)
+        _patch_sync_wait(monkeypatch, counts=[(1.0, 0.0), (2.0, 0.0)])
+        unconfigured = ops.testing.Container(
+            name="git-sync",
+            can_connect=True,
+            mounts={"content": ops.testing.Mount(location="/git/repo", source=repo_dir)},
+        )
+        provider_relation = _provider_relation()
+        state = ops.testing.State(
+            leader=True,
+            containers=[unconfigured],
+            relations=[_public_relation(), provider_relation, _peer_relation()],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        state_out = context.run(context.on.action("sync-now"), state)
+        assert "git-sync" in state_out.get_container("git-sync").plan.services
+        out_provider = state_out.get_relation(provider_relation.id)
+        assert "provider-configuration" in out_provider.local_app_data
+
+    def test_sync_now_withdraws_config_when_source_removed(self, context, synced_container):
+        """A failing sync-now still withdraws config whose source has gone away.
+
+        Reconciling is not optional just because the operator asked for a sync:
+        if the git relation is gone, the published configuration can no longer be
+        refreshed, so the action reports the failure *and* leaves the unit in the
+        same converged state any other event would (spec 2.2, 4.2).
+        """
+        git_relation = _public_relation()
+        provider_relation = _provider_relation()
+        state = ops.testing.State(
+            leader=True,
+            containers=[synced_container],
+            relations=[git_relation, provider_relation, _peer_relation()],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        published = context.run(context.on.relation_changed(git_relation), state)
+        assert "provider-configuration" in published.get_relation(
+            provider_relation.id
+        ).local_app_data
+
+        without_git = ops.testing.State(
+            leader=True,
+            containers=list(published.containers),
+            relations=[r for r in published.relations if r.endpoint != GIT_RELATION],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        with pytest.raises(ops.testing.ActionFailed) as excinfo:
+            context.run(context.on.action("sync-now"), without_git)
+        assert excinfo.value.message == charm_module.MISSING_GIT_RELATION_MESSAGE
+        out_provider = excinfo.value.state.get_relation(provider_relation.id)
+        assert "provider-configuration" not in out_provider.local_app_data
+        out_peer = next(r for r in excinfo.value.state.relations if r.endpoint == "replicas")
+        assert charm_module.PEER_CONFIG_HASH_KEY not in out_peer.local_app_data
 
 
 class TestGitSyncCounts:

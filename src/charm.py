@@ -225,8 +225,34 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
 
     # ---- reconcile --------------------------------------------------------
 
-    def _reconcile(self, _: ops.EventBase, *, force_publish: bool = False) -> None:
-        """Idempotent reconcile: configure git-sync and publish synced config."""
+    def _reconcile(
+        self, _: ops.EventBase, *, force_publish: bool = False, force_sync: bool = False
+    ) -> str | None:
+        """Idempotent reconcile: configure git-sync and publish synced config.
+
+        The single reconciliation path for every event, including the sync-now
+        action: the action's extra behaviour is expressed as flags rather than a
+        parallel implementation, so there is one place where prerequisites,
+        git-sync configuration and publishing are sequenced.
+
+        Unit status is always set here. Callers that must also report the outcome
+        to the operator (the action, via event.fail) use the returned message
+        instead of catching ExitWithStatusError themselves.
+
+        Args:
+            force_publish: bypass the content-hash dedup and republish even when
+                the configuration is unchanged. Used by secret-changed, where the
+                sensitive values can move without changing the hash.
+            force_sync: make the already-running git-sync fetch from the remote
+                now and wait for it, instead of waiting for its next `--period`
+                tick. Implies force_publish: an operator asking for a sync expects
+                the result to reach the coordinator even if the content is
+                unchanged.
+
+        Returns:
+            None once the unit has converged, otherwise the failure message that
+            was also set as the unit status.
+        """
         try:
             self._validate_prerequisites()
         except ExitWithStatusError as e:
@@ -242,18 +268,24 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
                 # empty is what makes the coordinator reconfigure (spec 2.2, 4.2).
                 self._clear_configuration()
             self.unit.status = e.status
-            return
+            return e.message
         try:
+            # Ordered before the forced sync so the fetch uses the current layer
+            # (repo, ref, credentials) rather than whatever git-sync was last
+            # started with.
             self._configure_pebble_layer()
-            self._publish_configuration(force=force_publish)
+            if force_sync:
+                self._trigger_sync()
+            self._publish_configuration(force=force_publish or force_sync)
         except ExitWithStatusError as e:
             # Prerequisites are met and git-sync is configured; a later failure
             # (e.g. file not yet synced) should not stop git-sync, so it can pick
             # up the content once it appears.
             logger.error(e)
             self.unit.status = e.status
-            return
+            return e.message
         self.unit.status = ops.ActiveStatus()
+        return None
 
     def _on_secret_changed(self, event: ops.SecretChangedEvent) -> None:
         """Reconcile, forcing the publish past the content-hash dedup.
@@ -721,22 +753,17 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         fetch from the remote once and waits for that to finish (rather than
         waiting for the poller's next `--period` tick), then republishes the
         resulting configuration with dedup bypassed so the publish happens even
-        when the content is unchanged. Fails cleanly (no false "republished")
-        if prerequisites are unmet or the fetch fails.
+        when the content is unchanged.
 
-        This deliberately does not go through `_reconcile`. `_reconcile` is the
-        idempotent, converge-to-desired-state path: it skips work when nothing
-        changed and reports problems via unit status. The action needs the
-        opposite on both counts — it must republish even when nothing changed,
-        and it must surface failures through `event.fail` so the operator sees
-        them in the action result rather than only in unit status.
+        The work itself is `_reconcile` with `force_sync=True`, so the action
+        cannot drift from the event-driven path. Only the reporting differs: the
+        operator ran this and is waiting on a result, so a failure is surfaced
+        through `event.fail` as well as unit status, and no false "republished"
+        is returned.
         """
-        try:
-            self._validate_prerequisites()
-            self._trigger_sync()
-            self._publish_configuration(force=True)
-        except ExitWithStatusError as e:
-            event.fail(e.message)
+        failure = self._reconcile(event, force_sync=True)
+        if failure:
+            event.fail(failure)
             return
         event.set_results({"result": "Provider configuration republished."})
 
