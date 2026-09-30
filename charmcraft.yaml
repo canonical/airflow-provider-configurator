@@ -71,12 +71,14 @@ config:
       type: secret
       description: |
         A Juju secret that contains a JSON string under the key
-        `airflow_provider_configurations`, a map of provider name to a nested
+        `airflow-provider-configurations`, a map of provider name to a nested
         section/option map of sensitive config values, e.g.:
         {"provider": {"section": {"option": "secret-value"}}}
         The provider-name nesting is for the admin's authoring convenience; the
         charm flattens it (drops the provider key, keeps the nested
         section/option/value structure).
+        Note the key is hyphenated: Juju does not allow underscores in secret
+        keys, so it cannot be spelled `airflow_provider_configurations`.
     airflow_provider_configurations_file_path:
       type: string
       description: |

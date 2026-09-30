@@ -6,7 +6,7 @@
 
 The operator supplies sensitive provider values through a Juju user secret (the
 `airflow_provider_configurations_secret` config option). The secret holds a JSON
-string under the key `airflow_provider_configurations`, structured as a map of
+string under the key `airflow-provider-configurations`, structured as a map of
 provider name to a nested section/option map, e.g.::
 
     {"databricks": {"databricks": {"token": "dapi-xxx"}},
@@ -21,7 +21,12 @@ is a prohibited collision (spec 3.3) and raises DuplicateSensitiveKeyError.
 import json
 
 # The key inside the user secret whose value is the JSON payload.
-SENSITIVE_CONFIG_SECRET_KEY = "airflow_provider_configurations"
+#
+# Spec 1.1 names this key `airflow_provider_configurations`, but Juju rejects
+# underscores in secret keys ("key ... not valid"), so that payload cannot be
+# created with `juju add-secret` at all and the option would be unusable. The
+# hyphenated spelling is the same name in the form Juju accepts.
+SENSITIVE_CONFIG_SECRET_KEY = "airflow-provider-configurations"
 
 
 class DuplicateSensitiveKeyError(Exception):
