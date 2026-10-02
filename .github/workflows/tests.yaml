@@ -66,14 +66,15 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install charmcraft
-        run: |
-          sudo snap install lxd
-          sudo lxd init --auto
-          sudo snap install charmcraft --channel 4.x/stable --classic
-
+      # Use the official action rather than installing LXD by hand: it
+      # provisions LXD in a way that works on GitHub runners, where Docker's
+      # iptables rules otherwise block the LXD bridge and `apt-get update`
+      # fails inside the build container.
       - name: Pack charm
-        run: sudo charmcraft pack --verbosity trace
+        uses: canonical/craft-actions/charmcraft/pack@v0.1.1
+        with:
+          channel: 4.x/stable
+          verbosity: trace
 
       - name: Upload charm artifact
         uses: actions/upload-artifact@v7
