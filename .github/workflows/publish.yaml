@@ -1,0 +1,46 @@
+# Copyright 2026 Canonical Ltd.
+# See LICENSE file for licensing details.
+
+name: Publish charm
+
+on:
+  push:
+    branches:
+      - track/**
+    paths-ignore:
+      - '**.md'
+      - '.github/workflows/promote.yaml'
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  tests:
+    name: Release tests
+    uses: ./.github/workflows/tests.yaml
+    permissions:
+      contents: read
+
+  publish:
+    name: 'Publish charm to edge | amd64'
+    runs-on: ubuntu-latest
+    needs:
+      - tests
+    permissions:
+      contents: write  # Needed to push the release tag.
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Upload charm package
+        uses: canonical/charming-actions/upload-charm@2.7.0
+        with:
+          credentials: ${{ secrets.CHARMHUB_TOKEN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          channel: 1.0/edge
+          tag-prefix: airflow-provider-configurator
+          # charmcraft 4.x is required: charmcraft.yaml uses `base: ubuntu@26.04`
+          # with the `uv` plugin, which 3.x cannot build.
+          charmcraft-channel: 4.x/stable
