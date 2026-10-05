@@ -34,6 +34,28 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      # Reuse the charm that `tests.yaml` already packed and uploaded, rather
+      # than letting upload-charm pack again. Its `destructive-mode` defaults to
+      # true, which builds directly on the runner, and `ubuntu-latest` is 24.04
+      # while this charm's base is ubuntu@26.04. Publishing the tested artifact
+      # also avoids building the charm twice.
+      - name: Download charm artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: charm-amd64
+          path: built-charm
+
+      - name: Locate the charm file
+        id: charm
+        run: |
+          set -euo pipefail
+          CHARM=$(find built-charm -maxdepth 1 -name '*.charm' | head -n1)
+          if [[ -z "${CHARM}" ]]; then
+            echo "::error::No .charm file found in the downloaded artifact."
+            exit 1
+          fi
+          echo "path=${CHARM}" >> "$GITHUB_OUTPUT"
+
       - name: Upload charm package
         uses: canonical/charming-actions/upload-charm@2.7.0
         with:
@@ -41,6 +63,4 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           channel: 1.0/edge
           tag-prefix: airflow-provider-configurator
-          # charmcraft 4.x is required: charmcraft.yaml uses `base: ubuntu@26.04`
-          # with the `uv` plugin, which 3.x cannot build.
-          charmcraft-channel: 4.x/stable
+          built-charm-path: ${{ steps.charm.outputs.path }}

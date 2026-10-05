@@ -62,15 +62,13 @@ jobs:
 
       - name: Build a PEP 440 dev version
         working-directory: lib
-        env:
-          COMMIT_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           VERSION=$(uv version | awk '{print $2}')
-          # The suffix must be unique per run and numeric-only: PEP 440 dev
-          # segments cannot contain a hex SHA, so convert it to decimal.
-          DEC_SHA=$((16#${COMMIT_SHA:0:7}))
-          uv version "${VERSION}.dev${GITHUB_RUN_NUMBER}${DEC_SHA}"
+          # GITHUB_RUN_NUMBER is unique per workflow, which is all PyPI needs to
+          # reject a duplicate upload, and it points straight at the run in the
+          # Actions tab.
+          uv version "${VERSION}.dev${GITHUB_RUN_NUMBER}"
           uv version
 
       - name: Build sdist and wheel
