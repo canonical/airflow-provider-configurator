@@ -49,9 +49,17 @@ deny:
   - "core.enable_xcom_pickling"  # pickle payloads execute on load (Airflow 2.x)
 
   # -- Authentication: these can switch the API/UI to an unauthenticated mode.
-  - "api.auth_backends"         # e.g. airflow.api.auth.backend.default (Airflow 2.x)
-  - "core.auth_manager"         # e.g. SimpleAuthManager (Airflow 3.x)
-  - "webserver.expose_config"   # serves airflow.cfg contents through the UI
+  #    Spellings verified against the Airflow 3.x config schema; the 2.x names
+  #    are kept alongside them per the version policy above.
+  - "api.auth_backends"         # airflow.api.auth.backend.default (Airflow 2.x)
+  - "fab.auth_backends"         # same option, moved to the FAB provider (3.x)
+  - "core.auth_manager"         # e.g. SimpleAuthManager
+  # core.auth_manager DEFAULTS to SimpleAuthManager, so these two are live in a
+  # stock deployment rather than only after someone opts in.
+  - "core.simple_auth_manager_all_admins"  # documented as "disable authentication"
+  - "core.simple_auth_manager_users"       # controls who can access the environment
+  - "webserver.expose_config"   # serves airflow.cfg through the UI (Airflow 2.x)
+  - "api.expose_config"         # same option, moved to [api] (3.x; masks secrets)
 
   # -- Task execution environment. Layer 1 only covers these while
   #    airflow-kubernetes-executor is deployed and related; with no such
