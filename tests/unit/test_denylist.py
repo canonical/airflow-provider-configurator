@@ -9,6 +9,7 @@ import ops
 import ops.testing
 import pytest
 
+import charm as charm_module
 import denylist
 from charm import AirflowProviderConfiguratorCharm
 
@@ -373,3 +374,69 @@ def test_dropped_key_logged_as_warning(context, tmp_path):
     assert any("core.dags_folder" in message and "Layer 2" in message for message in warnings), (
         warnings
     )
+
+
+@pytest.mark.parametrize(
+    "ini",
+    [
+        "dags_folder = /tmp/evil\n",  # no section header
+        "[core]\nparallelism = 1\nparallelism = 2\n",  # duplicate option
+        "[core]\nx = 1\n[core]\ny = 2\n",  # duplicate section
+        "<<<<<<< HEAD\nnot ini at all\n",  # unresolved merge conflict
+    ],
+)
+def test_malformed_ini_blocks_instead_of_erroring(context, tmp_path, ini):
+    """A file configparser rejects blocks the unit rather than erroring the hook.
+
+    configparser raises on these inputs. Letting that propagate would put the
+    unit in Juju's error state and retry the hook forever; a file that cannot be
+    parsed is an authoring mistake just like a missing one (spec 1.3), so it
+    blocks and waits for the next sync to bring a corrected file.
+    """
+    container = _container_with_ini(tmp_path, ini)
+    git_relation = _git_relation()
+    provider_relation = _provider_relation()
+    state = ops.testing.State(
+        leader=True,
+        containers=[container],
+        relations=[git_relation, provider_relation],
+        config={FILE_PATH_CONFIG: "providers.ini"},
+    )
+
+    state_out = context.run(context.on.relation_changed(git_relation), state)
+
+    assert state_out.unit_status == ops.BlockedStatus(charm_module.MALFORMED_CONFIG_FILE_MESSAGE)
+    # Nothing half-parsed should have reached the coordinator.
+    out_provider = state_out.get_relation(provider_relation.id)
+    assert out_provider.local_app_data == {}
+
+
+def test_malformed_ini_does_not_clear_published_config(context, tmp_path):
+    """A file that goes malformed leaves the last good config in place.
+
+    Blocking is the right response, but it must not look like an empty config:
+    clearing the databag would make the coordinator drop working provider
+    settings because of a typo in a commit (spec 2.2 cleanup is for an *empty*
+    config, not one that cannot be read).
+    """
+    container = _container_with_ini(tmp_path, "[gcs]\nconn_id = default_gcp\n")
+    git_relation = _git_relation()
+    provider_relation = _provider_relation()
+    state = ops.testing.State(
+        leader=True,
+        containers=[container],
+        relations=[git_relation, provider_relation, _peer_relation()],
+        config={FILE_PATH_CONFIG: "providers.ini"},
+    )
+
+    # Publish a good configuration first.
+    state_after_good = context.run(context.on.relation_changed(git_relation), state)
+    published = state_after_good.get_relation(provider_relation.id).local_app_data
+    assert published.get("provider-configuration")
+
+    # The repository is then updated with a broken file.
+    (tmp_path / "repo" / "providers.ini").write_text("<<<<<<< HEAD\nbroken\n")
+    state_out = context.run(context.on.update_status(), state_after_good)
+
+    assert state_out.unit_status == ops.BlockedStatus(charm_module.MALFORMED_CONFIG_FILE_MESSAGE)
+    assert state_out.get_relation(provider_relation.id).local_app_data == published

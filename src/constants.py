@@ -92,3 +92,11 @@ SYNC_NOW_FETCH_FAILED_MESSAGE = (
 DROPPED_PROVIDER_CONFIG_MESSAGE = "Dropped disallowed provider config: {keys}"
 # Log line emitted per dropped key; names the key and which layer caught it.
 DENYLIST_DROP_LOG = "Layer 2 denylist: dropped disallowed provider configuration key '%s'"
+
+# The synced file cannot be parsed as INI (no section header, duplicate option,
+# unresolved merge conflict markers, ...). Like a missing file (spec 1.3) this is
+# an authoring mistake only the operator can fix, so block and wait for the next
+# sync rather than letting the hook error and retry forever.
+MALFORMED_CONFIG_FILE_MESSAGE = (
+    "Provider configuration file is not valid INI; check the file in the repository"
+)
