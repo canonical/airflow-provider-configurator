@@ -32,12 +32,15 @@ import ops
 from airflow_provider_configurator import AirflowProviderConfiguratorProvides
 
 import config_generator
+import denylist
 import sensitive_config
 from constants import (
     CONFIG_FILE_PATH,
     CONFIG_SENSITIVE_SECRET,
     CONFIG_SYNC_PERIOD,
     CONTENT_SYNCED_NOTICE_KEY,
+    DENYLIST_DROP_LOG,
+    DROPPED_PROVIDER_CONFIG_MESSAGE,
     ESCAPING_FILE_PATH_MESSAGE,
     EXECHOOK_SCRIPT_PATH,
     GIT_RELATION_NAME,
@@ -99,6 +102,11 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         self._container = self.unit.get_container(WORKLOAD_CONTAINER)
         self._sync_period = str(self.config[CONFIG_SYNC_PERIOD])
         self._config_provider = AirflowProviderConfiguratorProvides(self)
+
+        # Layer 2 keys dropped during this hook, recorded in _publish_configuration
+        # (before the content-hash dedup) so the status still reflects them on a
+        # deduped reconcile. Reset per hook; one charm instance per Juju event.
+        self._dropped_keys: list[str] = []
 
         # GitRequires(callback=...) already observes git_connection_information_updated,
         # relation_joined and relation_broken, so those are not repeated here.
@@ -284,8 +292,21 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
             logger.error(e)
             self.unit.status = e.status
             return e.message
-        self.unit.status = ops.ActiveStatus()
+        self.unit.status = self._reconciled_status()
         return None
+
+    def _reconciled_status(self) -> ops.StatusBase:
+        """The Active status for a converged unit, noting any Layer 2 drops.
+
+        Non-blocking (spec 3.4): the unit stays Active, but when provider
+        configuration was dropped by the denylist the message names the dropped
+        keys so the operator sees it without reading the logs.
+        """
+        if self._dropped_keys:
+            return ops.ActiveStatus(
+                DROPPED_PROVIDER_CONFIG_MESSAGE.format(keys=", ".join(self._dropped_keys))
+            )
+        return ops.ActiveStatus()
 
     def _on_secret_changed(self, event: ops.SecretChangedEvent) -> None:
         """Reconcile, forcing the publish past the content-hash dedup.
@@ -408,6 +429,12 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         """
         ini_content = self._read_synced_file()
         sensitive_data = self._sensitive_data()
+        # Layer 2 validation (spec 3.2.2): drop statically-denied keys from both
+        # inputs before building the template. Recorded here -- ahead of the
+        # content-hash dedup below -- so the dropped-keys status is set on every
+        # reconcile, including the deduped ones that return early.
+        ini_content, sensitive_data, dropped = denylist.apply_denylist(ini_content, sensitive_data)
+        self._record_dropped_keys(dropped)
         template, flat_sensitive = config_generator.build_template_and_secrets(
             ini_content, sensitive_data=sensitive_data
         )
@@ -439,6 +466,17 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
                 provider_configuration_sensitive_data=flat_sensitive,
             )
         self._store_config_hash(config_hash)
+
+    def _record_dropped_keys(self, dropped: list[str]) -> None:
+        """Record Layer 2 drops for this hook and log a WARNING per dropped key.
+
+        Stored on the instance so _reconciled_status can surface a non-blocking
+        status message even when the publish is deduped away (spec 3.4). A WARNING
+        is logged for each key naming it and the layer that caught it.
+        """
+        self._dropped_keys = dropped
+        for key in dropped:
+            logger.warning(DENYLIST_DROP_LOG, key)
 
     @staticmethod
     def _config_hash(template: str, sensitive_secret_id: str | None) -> str:

@@ -12,6 +12,7 @@ requires-python = ">=3.12"
 dependencies = [
     "ops>=3,<4",
     "pydantic>=2",
+    "PyYAML>=6",
     "airflow-provider-configurator-charmlib",
 ]
 

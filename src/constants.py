@@ -85,3 +85,10 @@ SYNC_NOW_FETCH_FAILED_MESSAGE = (
     "Forced git-sync failed to fetch from the repository; "
     "check the git-sync logs and the repository configuration"
 )
+
+# Layer 2 validation (spec 3.2.2 / 3.4). Dropping a denied key is non-blocking:
+# the unit stays Active but its status names what was dropped, and a WARNING is
+# logged per key. {keys} is a comma-separated list of "section.option".
+DROPPED_PROVIDER_CONFIG_MESSAGE = "Dropped disallowed provider config: {keys}"
+# Log line emitted per dropped key; names the key and which layer caught it.
+DENYLIST_DROP_LOG = "Layer 2 denylist: dropped disallowed provider configuration key '%s'"

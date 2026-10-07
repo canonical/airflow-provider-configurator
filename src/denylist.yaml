@@ -1,0 +1,62 @@
+# Layer 2 denylist -- spec WF029 section 3.2.2.
+#
+# A short, team-maintained list of "section.option" keys that are catastrophic
+# regardless of what the airflow-coordinator currently renders. This is the
+# residual case Layer 1 (dynamic collision detection against the coordinator's
+# owned_keys) cannot catch, because Layer 1 only knows what is *currently*
+# rendered, not what is *always* dangerous.
+#
+# The test applied here is "redirects where Airflow's own code comes from, or
+# disables authentication", NOT "causes a class to be imported" -- Airflow
+# imports provider classes everywhere by design, so the latter would deny the
+# very integrations this charm exists to enable.
+#
+# Matching notes (see denylist.py):
+#   * Keys are matched case-insensitively: Airflow lowercases option names when
+#     it reads airflow.cfg, so `DAGS_FOLDER` is the same setting as
+#     `dags_folder` and must not slip past on casing alone.
+#   * A denied option also covers its `_cmd` and `_secret` variants, which
+#     Airflow accepts in place of the bare option (`_cmd` runs its value as a
+#     shell command). They are never listed individually below.
+#
+# Spellings differ across Airflow versions (e.g. api.auth_backends in 2.x vs
+# core.auth_manager in 3.x). Listing a key that does not exist in the deployed
+# version is harmless -- it simply never matches -- so both spellings are kept
+# rather than branching on version.
+#
+# Deliberately NOT denied here:
+#   * secrets.backend / secrets.backend_kwargs, logging.remote_logging /
+#     logging.remote_base_log_folder -- legitimate, documented provider
+#     integration surfaces (spec 3.1); an allow/deny list that rejected these
+#     is exactly what the spec rejected.
+#   * core.xcom_backend, email.email_backend -- same category: these are the
+#     documented way to install the object-storage XCom backends and the SES /
+#     SendGrid emailers, so denying them would break supported providers.
+#   * core.fernet_key, api.secret_key, api_auth.jwt_secret, *.sql_alchemy_conn --
+#     coordinator-owned; caught dynamically by Layer 1 collision detection.
+#     (Their `_cmd` variants are NOT coordinator-owned, but are covered by the
+#     suffix rule above wherever the bare option is denied.)
+deny:
+  # -- Code and plugin locations: redirecting these is arbitrary code execution.
+  - "core.dags_folder"          # redirect DAG source (spec example)
+  - "core.plugins_folder"       # load arbitrary plugins
+  - "core.hostname_callable"    # arbitrary callable imported and executed
+
+  # -- Deserialization: widening these lets attacker-controlled payloads
+  #    instantiate arbitrary classes from XComs and DAG params.
+  - "core.allowed_deserialization_classes"
+  - "core.allowed_deserialization_classes_regexp"
+  - "core.enable_xcom_pickling"  # pickle payloads execute on load (Airflow 2.x)
+
+  # -- Authentication: these can switch the API/UI to an unauthenticated mode.
+  - "api.auth_backends"         # e.g. airflow.api.auth.backend.default (Airflow 2.x)
+  - "core.auth_manager"         # e.g. SimpleAuthManager (Airflow 3.x)
+  - "webserver.expose_config"   # serves airflow.cfg contents through the UI
+
+  # -- Task execution environment. Layer 1 only covers these while
+  #    airflow-kubernetes-executor is deployed and related; with no such
+  #    relation nothing else catches them, and they decide which image runs and
+  #    with which privileges. The spec abstract names this charm explicitly.
+  - "kubernetes_executor.pod_template_file"
+  - "kubernetes_executor.worker_container_repository"
+  - "kubernetes_executor.worker_container_tag"
