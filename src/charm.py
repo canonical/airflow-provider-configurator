@@ -41,6 +41,7 @@ from constants import (
     CONFIG_SYNC_PERIOD,
     CONTENT_SYNCED_NOTICE_KEY,
     DENYLIST_DROP_LOG,
+    DENYLIST_UNAVAILABLE_MESSAGE,
     DROPPED_PROVIDER_CONFIG_MESSAGE,
     ESCAPING_FILE_PATH_MESSAGE,
     EXECHOOK_SCRIPT_PATH,
@@ -427,8 +428,8 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
 
         Raises:
             ExitWithStatusError: if the file is missing or cannot be parsed as
-                INI, or the sensitive secret is set but unreadable / invalid /
-                has a collision.
+                INI, the sensitive secret is set but unreadable / invalid / has
+                a collision, or the denylist itself cannot be loaded.
         """
         ini_content = self._read_synced_file()
         sensitive_data = self._sensitive_data()
@@ -450,6 +451,12 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
             )
         except configparser.Error as e:
             raise ExitWithStatusError(MALFORMED_CONFIG_FILE_MESSAGE, ops.BlockedStatus) from e
+        except denylist.DenylistUnavailableError as e:
+            # Spec 3.4 governs violations; there is no offending key here, so it
+            # does not apply. Treated like a missing config file (spec 1.3):
+            # publishing would skip Layer 2 entirely with nothing to say so.
+            logger.error("Layer 2 denylist unavailable: %s", e)
+            raise ExitWithStatusError(DENYLIST_UNAVAILABLE_MESSAGE, ops.BlockedStatus) from e
         self._record_dropped_keys(dropped)
 
         config_hash = self._config_hash(template, self._sensitive_secret_id)

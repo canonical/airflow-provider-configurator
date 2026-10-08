@@ -34,27 +34,86 @@ conn_id = default_gcp
 
 
 def test_load_denylist_includes_shipped_keys():
-    """The shipped denylist.yaml loads and contains the spec's example key."""
+    """The shipped denylist.yaml loads and denies the spec's example key.
+
+    The spec's example is `core.dags_folder`; the shipped list covers it by
+    denying the whole `core` section rather than naming the option.
+    """
     loaded = denylist.load_denylist()
-    assert "core.dags_folder" in loaded
     assert isinstance(loaded, frozenset)
+    assert "core" in loaded
+    assert denylist._matches("core.dags_folder", loaded)
+
+
+def test_shipped_denylist_stays_short():
+    """Layer 2 is a short, reviewable list by design (spec 3.2.2).
+
+    Anything that grows with what the coordinator happens to render belongs in
+    Layer 1; see documentation/adr/0001-layer-2-denylist-scope.md. The bound is
+    a tripwire for that discussion, not a hard limit.
+    """
+    assert len(denylist.load_denylist()) <= 10
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "",  # empty file
+        "deny:\n",  # key present but null
+        "deny: []\n",  # key present but empty
+        "something_else: [a]\n",  # no deny key at all
+        "deny: not-a-list\n",  # wrong shape
+        "deny: [unclosed\n",  # not valid YAML
+    ],
+)
+def test_load_denylist_fails_closed(tmp_path, content):
+    """An unusable denylist raises rather than silently disabling Layer 2.
+
+    The file ships with the charm, so none of these states can be produced by an
+    operator: they mean the guard itself is broken. Returning an empty set would
+    publish provider configuration with no Layer 2 validation and no sign of it.
+    """
+    path = tmp_path / "denylist.yaml"
+    path.write_text(content)
+
+    with pytest.raises(denylist.DenylistUnavailableError):
+        denylist.load_denylist(path)
+
+
+def test_load_denylist_fails_closed_when_file_is_missing(tmp_path):
+    """A denylist that is not there at all is a charm fault, not an empty list."""
+    with pytest.raises(denylist.DenylistUnavailableError):
+        denylist.load_denylist(tmp_path / "does-not-exist.yaml")
 
 
 def test_shipped_denylist_entries_are_well_formed():
-    """Every shipped entry is a lower-case "section.option" pair.
+    """Every shipped entry is a lower-case section or "section.option" pair.
 
     Matching lowercases both sides, so an upper-case entry would still work, but
     keeping the file canonical makes it reviewable at a glance (spec 3.2.2 calls
     for team review of this list).
     """
-    for entry in denylist.load_denylist():
+    entries = denylist.load_denylist()
+    for entry in entries:
         assert entry == entry.lower().strip(), entry
-        assert entry.count(".") >= 1, entry
-        section, option = entry.split(".", 1)
-        assert section and option, entry
+        section, _, option = entry.partition(".")
+        assert section, entry
+        if not option:
+            # A whole-section entry; nothing further to check.
+            continue
+        # An option entry is redundant when its section is denied outright.
+        assert section not in entries, f"{entry} is implied by section {section}"
         # The `_cmd` / `_secret` variants are implied by the suffix rule and must
         # not be listed separately, or the list drifts out of sync with itself.
-        assert not option.endswith(denylist.SENSITIVE_VALUE_SUFFIXES), entry
+        #
+        # Checked by stripping the suffix rather than by rejecting the suffix
+        # outright: an option whose own name ends in `_secret` is a real option,
+        # not the `_secret` variant of a shorter one. An entry is redundant only
+        # when the stripped form is *also* listed.
+        for suffix in denylist.SENSITIVE_VALUE_SUFFIXES:
+            if option.endswith(suffix):
+                base = f"{section}.{option[: -len(suffix)]}"
+                assert base not in entries, f"{entry} is implied by {base}"
 
 
 def test_apply_denylist_drops_from_non_sensitive_ini():
@@ -248,6 +307,106 @@ def test_apply_denylist_suffix_rule_does_not_overreach():
 
 
 # --------------------------------------------------------------------------- #
+# Whole-section entries.
+# --------------------------------------------------------------------------- #
+
+
+def test_apply_denylist_drops_every_option_in_a_denied_section():
+    """A bare section entry denies all of its options, named or not.
+
+    This is what keeps the shipped list short and makes it hold when a future
+    Airflow release adds options to a denied section.
+    """
+    filtered_ini, filtered_sensitive, dropped = denylist.apply_denylist(
+        "[core]\ndags_folder = /tmp/evil\nsome_option_added_in_3_2 = x\n\n"
+        "[gcs]\nconn_id = default_gcp\n",
+        {"core": {"fernet_key": "s"}, "gcs": {"key_path": "/k"}},
+        denylist=frozenset({"core"}),
+    )
+
+    parser = configparser.RawConfigParser()
+    parser.optionxform = str
+    parser.read_string(filtered_ini)
+
+    assert not parser.has_section("core")
+    assert parser.get("gcs", "conn_id") == "default_gcp"
+    assert filtered_sensitive == {"gcs": {"key_path": "/k"}}
+    assert dropped == ["core.dags_folder", "core.fernet_key", "core.some_option_added_in_3_2"]
+
+
+def test_apply_denylist_section_entry_does_not_match_a_bare_option():
+    """A section entry must not be read as an option name.
+
+    [DEFAULT] options are matched on their bare name, with no section half. A
+    section entry sharing that name must not match there by accident.
+    """
+    filtered_ini, _, dropped = denylist.apply_denylist(
+        "[DEFAULT]\ncore = something\n\n[gcs]\nconn_id = default_gcp\n",
+        {},
+        denylist=frozenset({"core"}),
+    )
+
+    assert dropped == []
+    assert "something" in filtered_ini
+
+
+def test_apply_denylist_denied_default_section_drops_every_default():
+    """Denying `default` removes all [DEFAULT] options, which every section inherits."""
+    filtered_ini, _, dropped = denylist.apply_denylist(
+        "[DEFAULT]\nanything = /tmp/evil\n\n[gcs]\nconn_id = default_gcp\n",
+        {},
+        denylist=frozenset({"default"}),
+    )
+
+    assert dropped == ["DEFAULT.anything"]
+    assert "/tmp/evil" not in filtered_ini
+
+    parser = configparser.RawConfigParser()
+    parser.optionxform = str
+    parser.read_string(filtered_ini)
+    assert parser.defaults() == {}
+    assert parser.get("gcs", "conn_id") == "default_gcp"
+
+
+def test_shipped_denylist_blocks_the_sections_the_adr_names():
+    """End-to-end over the real shipped list, not a test fixture."""
+    _, _, dropped = denylist.apply_denylist(
+        "[core]\ndags_folder = /tmp/evil\n\n"
+        "[api]\nexpose_config = true\n\n"
+        "[dag_processor]\ndag_bundle_config_list = []\n\n"
+        "[webserver]\nsecret_key = hunter2\n\n"
+        "[fab]\nauth_backends = airflow.api.auth.backend.default\n\n"
+        "[gcs]\nconn_id = default_gcp\n",
+        {},
+    )
+
+    assert dropped == [
+        "api.expose_config",
+        "core.dags_folder",
+        "dag_processor.dag_bundle_config_list",
+        "fab.auth_backends",
+        "webserver.secret_key",
+    ]
+
+
+def test_shipped_denylist_leaves_shared_provider_sections_alone():
+    """Layer 2 guards Airflow's own sections, not every shared one.
+
+    The spec's canonical provider file writes to [secrets] and [logging], and
+    spec 3.1 defends that as legitimate -- `secrets.backend` is an import path,
+    which is exactly the kind of configuration this charm exists to relay.
+    """
+    _, _, dropped = denylist.apply_denylist(
+        "[secrets]\nbackend = airflow.providers.hashicorp.secrets.vault.VaultBackend\n\n"
+        "[logging]\nremote_logging = True\n\n"
+        "[google]\nkey_path = /k\n",
+        {},
+    )
+
+    assert dropped == []
+
+
+# --------------------------------------------------------------------------- #
 # Charm-level wiring tests.
 # --------------------------------------------------------------------------- #
 
@@ -293,7 +452,12 @@ def _peer_relation(local_app_data=None):
 
 
 def test_denied_key_dropped_and_status_set(context, tmp_path):
-    """A denied key is dropped from the published config; unit Active with a message."""
+    """A denied key is dropped from the published config; unit Active with a message.
+
+    Covers the full spec 3.4 contract for a violation: dropped, logged at
+    WARNING naming the key and the layer, status message set, unit not blocked,
+    and the rest of the file still published.
+    """
     container = _container_with_ini(tmp_path, INI_WITH_DENIED_KEY)
     git_relation = _git_relation()
     provider_relation = _provider_relation()
@@ -309,6 +473,10 @@ def test_denied_key_dropped_and_status_set(context, tmp_path):
     # Non-blocking: Active, with a message naming the dropped key.
     assert isinstance(state_out.unit_status, ops.ActiveStatus)
     assert "core.dags_folder" in state_out.unit_status.message
+
+    # A WARNING naming the key and the layer that caught it (spec 3.4).
+    warnings = [line.message for line in context.juju_log if line.level == "WARNING"]
+    assert any("core.dags_folder" in m and "Layer 2" in m for m in warnings)
 
     # The published template carries the benign key but not the denied one.
     out_provider = state_out.get_relation(provider_relation.id)
@@ -440,3 +608,38 @@ def test_malformed_ini_does_not_clear_published_config(context, tmp_path):
 
     assert state_out.unit_status == ops.BlockedStatus(charm_module.MALFORMED_CONFIG_FILE_MESSAGE)
     assert state_out.get_relation(provider_relation.id).local_app_data == published
+
+
+def test_denylist_unavailable_blocks_instead_of_publishing(context, tmp_path, monkeypatch):
+    """A denylist that cannot be loaded blocks, rather than publishing unvalidated.
+
+    The non-blocking rule (spec 3.4) covers a denied key in the provider's own
+    configuration. This is the guard itself failing, which is a charm fault, so
+    it gets the same treatment as a missing config file (spec 1.3).
+
+    load_denylist is patched rather than DENYLIST_PATH: the path is a default
+    argument, bound when the function is defined, so rebinding the module
+    attribute would not reach it. What the loader rejects is covered directly by
+    the test_load_denylist_fails_closed cases.
+    """
+
+    def _unavailable(*args, **kwargs):
+        raise denylist.DenylistUnavailableError("denylist.yaml is missing")
+
+    monkeypatch.setattr(denylist, "load_denylist", _unavailable)
+
+    container = _container_with_ini(tmp_path, "[gcs]\nconn_id = default_gcp\n")
+    git_relation = _git_relation()
+    provider_relation = _provider_relation()
+    state = ops.testing.State(
+        leader=True,
+        containers=[container],
+        relations=[git_relation, provider_relation],
+        config={FILE_PATH_CONFIG: "providers.ini"},
+    )
+
+    state_out = context.run(context.on.relation_changed(git_relation), state)
+
+    assert state_out.unit_status == ops.BlockedStatus(charm_module.DENYLIST_UNAVAILABLE_MESSAGE)
+    # Nothing may reach the coordinator while Layer 2 is not enforceable.
+    assert state_out.get_relation(provider_relation.id).local_app_data == {}

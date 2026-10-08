@@ -4,11 +4,15 @@
 
 """Layer 2 validation: a small, static denylist over provider configuration.
 
-Implements spec WF029 section 3.2.2. A short, team-maintained list of
-``section.option`` keys (shipped in ``denylist.yaml``) that are catastrophic
-regardless of what the coordinator currently renders -- the residual case the
-coordinator's dynamic Layer 1 collision detection cannot catch, because Layer 1
-only knows what is *currently* rendered, not what is *always* dangerous.
+Implements spec WF029 section 3.2.2. A short, team-maintained list (shipped in
+``denylist.yaml``) of whole sections and individual ``section.option`` keys that
+a provider must never set, regardless of what the coordinator currently renders
+-- the residual case the coordinator's dynamic Layer 1 collision detection
+cannot catch, because Layer 1 only knows what is *currently* rendered, not what
+is *always* out of bounds.
+
+Why the shipped list is section-shaped, and what it deliberately leaves to
+Layer 1, is recorded in documentation/adr/0001-layer-2-denylist-scope.md.
 
 ``apply_denylist`` drops any denied key from BOTH the non-sensitive .ini and the
 sensitive-data map (a denied option could be supplied either way), returning the
@@ -34,20 +38,42 @@ DENYLIST_PATH = Path(__file__).parent / "denylist.yaml"
 SENSITIVE_VALUE_SUFFIXES = ("_cmd", "_secret")
 
 
+class DenylistUnavailableError(Exception):
+    """The shipped denylist could not be loaded, so Layer 2 cannot be enforced.
+
+    Not a violation in the sense of spec 3.4: there is no offending key, because
+    the charm cannot judge any key at all. Treated like a missing config file
+    (spec 1.3) instead -- letting it pass would publish provider configuration
+    with no Layer 2 validation and nothing to say so, so the charm blocks.
+    """
+
+
 def load_denylist(path: Path = DENYLIST_PATH) -> frozenset[str]:
-    """Return the set of denied ``section.option`` keys from the denylist file.
+    """Return the set of denied entries from the denylist file.
 
     Args:
         path: location of the denylist YAML. Defaults to the one shipped next to
             this module; overridable for testing.
 
     Returns:
-        A frozenset of ``"section.option"`` strings. Empty if the file has no
-        ``deny`` list (or it is empty), so an empty/malformed-but-parseable file
-        simply disables Layer 2 rather than erroring.
+        A frozenset of entries, each either a bare ``"section"`` or a
+        ``"section.option"`` string.
+
+    Raises:
+        DenylistUnavailableError: if the file is missing, unreadable, not valid
+            YAML, or carries no non-empty ``deny`` list. The denylist ships with
+            the charm, so any of these means the deployed charm is broken rather
+            than that Layer 2 was meant to be switched off.
     """
-    data = yaml.safe_load(path.read_text()) or {}
-    return frozenset(data.get("deny") or [])
+    try:
+        data = yaml.safe_load(path.read_text())
+    except (OSError, yaml.YAMLError) as e:
+        raise DenylistUnavailableError(f"cannot read denylist at {path}: {e}") from e
+
+    entries = (data or {}).get("deny") if isinstance(data, dict) else None
+    if not entries or not isinstance(entries, list):
+        raise DenylistUnavailableError(f"denylist at {path} has no non-empty 'deny' list")
+    return frozenset(entries)
 
 
 def _key(section: str, option: str) -> str:
@@ -58,17 +84,28 @@ def _key(section: str, option: str) -> str:
 def _matches(candidate: str, denied: frozenset[str]) -> bool:
     """Return whether ``candidate`` is denied, allowing for case and suffixes.
 
-    Matching is case-insensitive because Airflow lowercases option names when it
-    reads airflow.cfg: ``DAGS_FOLDER`` and ``dags_folder`` are the same setting
-    to Airflow, so a case-sensitive denylist would be bypassed by the shift key
-    while Airflow still honoured the value. A denied option also covers its
-    ``_cmd`` / ``_secret`` variants (see SENSITIVE_VALUE_SUFFIXES).
+    An entry without a ``.`` denies a whole section, so every option in it is
+    matched without having to be enumerated. That is how the shipped list stays
+    short enough to review (spec 3.2.2) while still covering options added by a
+    future Airflow release.
+
+    Matching is case-insensitive, for section names as much as option names:
+    Airflow lowercases both when it reads airflow.cfg, so ``[CORE] DAGS_FOLDER``
+    and ``[core] dags_folder`` are the same setting to Airflow. A case-sensitive
+    denylist would be bypassed with the shift key while Airflow still honoured
+    the value. A denied option also covers its ``_cmd`` / ``_secret`` variants
+    (see SENSITIVE_VALUE_SUFFIXES).
 
     Args:
         candidate: a ``section.option`` key or a bare option name.
         denied: the matching denied set, already lowercased.
     """
     candidate = candidate.lower()
+    # Only for a `section.option` candidate: a bare option name (the [DEFAULT]
+    # case) has no section half to test, and must not be read as one.
+    section, dot, _ = candidate.partition(".")
+    if dot and section in denied:
+        return True
     if candidate in denied:
         return True
     return any(
@@ -81,7 +118,9 @@ def _denied_option_names(denylist: frozenset[str]) -> frozenset[str]:
     """Return the lowercased option half of every denied ``section.option`` key.
 
     Used for [DEFAULT], where an option applies under whatever section names the
-    file happens to use, so the section half cannot be matched on.
+    file happens to use, so the section half cannot be matched on. Whole-section
+    entries contribute nothing here and are skipped; [DEFAULT] against those is
+    handled separately in ``_filter_ini``.
     """
     return frozenset(key.split(".", 1)[1].lower() for key in denylist if "." in key)
 
@@ -108,12 +147,15 @@ def _filter_ini(non_sensitive_ini: str, denylist: frozenset[str], dropped: set[s
     # [DEFAULT] options are inherited by every section, including sections added
     # later, and configparser cannot remove an inherited default from an
     # individual section -- remove_option() would report success while write()
-    # re-emitted the value. So denied options must be dropped at the source. The
-    # test is the bare option name against every denied key, because a default
-    # applies under whatever section names the file happens to use.
+    # re-emitted the value. So denied options must be dropped at the source.
     denied_option_names = _denied_option_names(denylist)
     for option in list(parser.defaults()):
-        if _matches(option, denied_option_names):
+        # Two ways a default is denied: [DEFAULT] itself is a denied section, or
+        # the option name is denied under some section (so it would be denied
+        # wherever the default landed).
+        if _matches(_key(configparser.DEFAULTSECT, option), denylist) or _matches(
+            option, denied_option_names
+        ):
             parser.remove_option(configparser.DEFAULTSECT, option)
             dropped.add(_key(configparser.DEFAULTSECT, option))
 
@@ -177,14 +219,19 @@ def apply_denylist(
         non_sensitive_ini: the INI string synced from git.
         sensitive_data: the nested ``{section: {option: value}}`` map from the
             user secret.
-        denylist: the set of denied keys; loaded from ``denylist.yaml`` when not
-            supplied (overridable for testing). Matched case-insensitively.
+        denylist: the set of denied sections and ``section.option`` keys; loaded
+            from ``denylist.yaml`` when not supplied (overridable for testing).
+            Matched case-insensitively.
 
     Returns:
         A tuple of ``(filtered_ini, filtered_sensitive, dropped_keys)`` where
         ``dropped_keys`` is the sorted, de-duplicated list of ``section.option``
         keys that were removed from either input, spelled as they appeared in
         the input so the operator recognises what was dropped.
+
+    Raises:
+        DenylistUnavailableError: if ``denylist`` was not supplied and the
+            shipped file could not be loaded.
     """
     if denylist is None:
         denylist = load_denylist()

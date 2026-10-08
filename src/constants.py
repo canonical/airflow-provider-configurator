@@ -92,6 +92,11 @@ SYNC_NOW_FETCH_FAILED_MESSAGE = (
 DROPPED_PROVIDER_CONFIG_MESSAGE = "Dropped disallowed provider config: {keys}"
 # Log line emitted per dropped key; names the key and which layer caught it.
 DENYLIST_DROP_LOG = "Layer 2 denylist: dropped disallowed provider configuration key '%s'"
+# The shipped denylist itself could not be loaded. Not covered by the
+# non-blocking rule above: spec 3.4 governs *violations*, and there is no
+# offending key here -- the charm cannot judge any key at all. Treated like a
+# missing config file (spec 1.3): block rather than publish unvalidated.
+DENYLIST_UNAVAILABLE_MESSAGE = "Cannot load the configuration denylist; refusing to publish"
 
 # The synced file cannot be parsed as INI (no section header, duplicate option,
 # unresolved merge conflict markers, ...). Like a missing file (spec 1.3) this is

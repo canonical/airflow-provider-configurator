@@ -1,70 +1,36 @@
 # Layer 2 denylist -- spec WF029 section 3.2.2.
 #
-# A short, team-maintained list of "section.option" keys that are catastrophic
-# regardless of what the airflow-coordinator currently renders. This is the
-# residual case Layer 1 (dynamic collision detection against the coordinator's
-# owned_keys) cannot catch, because Layer 1 only knows what is *currently*
-# rendered, not what is *always* dangerous.
+# An entry is either a whole section (`core`) or a single option
+# (`fab.auth_backends`). Matching is case-insensitive, and a denied option also
+# covers its `_cmd` / `_secret` variants; see denylist.py.
 #
-# The test applied here is "redirects where Airflow's own code comes from, or
-# disables authentication", NOT "causes a class to be imported" -- Airflow
-# imports provider classes everywhere by design, so the latter would deny the
-# very integrations this charm exists to enable.
+# Airflow 3.x spellings only. This charm does not support Airflow 2.x, so 2.x
+# names such as `webserver.expose_config` are deliberately absent.
 #
-# Matching notes (see denylist.py):
-#   * Keys are matched case-insensitively: Airflow lowercases option names when
-#     it reads airflow.cfg, so `DAGS_FOLDER` is the same setting as
-#     `dags_folder` and must not slip past on casing alone.
-#   * A denied option also covers its `_cmd` and `_secret` variants, which
-#     Airflow accepts in place of the bare option (`_cmd` runs its value as a
-#     shell command). They are never listed individually below.
-#
-# Spellings differ across Airflow versions (e.g. api.auth_backends in 2.x vs
-# core.auth_manager in 3.x). Listing a key that does not exist in the deployed
-# version is harmless -- it simply never matches -- so both spellings are kept
-# rather than branching on version.
-#
-# Deliberately NOT denied here:
-#   * secrets.backend / secrets.backend_kwargs, logging.remote_logging /
-#     logging.remote_base_log_folder -- legitimate, documented provider
-#     integration surfaces (spec 3.1); an allow/deny list that rejected these
-#     is exactly what the spec rejected.
-#   * core.xcom_backend, email.email_backend -- same category: these are the
-#     documented way to install the object-storage XCom backends and the SES /
-#     SendGrid emailers, so denying them would break supported providers.
-#   * core.fernet_key, api.secret_key, api_auth.jwt_secret, *.sql_alchemy_conn --
-#     coordinator-owned; caught dynamically by Layer 1 collision detection.
-#     (Their `_cmd` variants are NOT coordinator-owned, but are covered by the
-#     suffix rule above wherever the bare option is denied.)
+# This list is deliberately short, and it does NOT restate what the
+# coordinator's dynamic Layer 1 collision detection already catches. The
+# reasoning, and what it leaves open, is in
+# documentation/adr/0001-layer-2-denylist-scope.md. Read that before adding an
+# entry.
 deny:
-  # -- Code and plugin locations: redirecting these is arbitrary code execution.
-  - "core.dags_folder"          # redirect DAG source (spec example)
-  - "core.plugins_folder"       # load arbitrary plugins
-  - "core.hostname_callable"    # arbitrary callable imported and executed
+  # Sections Airflow's own machinery owns. A provider may legitimately write to
+  # plenty of shared sections -- `[secrets]`, `[logging]` -- but not to these.
+  # Denying them wholesale is shorter to review than an option-by-option list,
+  # and stays correct when a future Airflow release adds options to them.
+  - "core" # DAG and plugin paths, executor, deserialization, auth manager, fernet key
+  - "api" # API/UI exposure, session signing, expose_config
+  - "dag_processor" # DAG bundle configuration, i.e. where DAG code is fetched from
 
-  # -- Deserialization: widening these lets attacker-controlled payloads
-  #    instantiate arbitrary classes from XComs and DAG params.
-  - "core.allowed_deserialization_classes"
-  - "core.allowed_deserialization_classes_regexp"
-  - "core.enable_xcom_pickling"  # pickle payloads execute on load (Airflow 2.x)
+  # Airflow 3.x still honours some 2.x section names, and denying the new
+  # spelling does NOT deny the alias: `[webserver] secret_key` is still read as
+  # `[api] secret_key`. No provider has a reason to write here either way.
+  - "webserver"
 
-  # -- Authentication: these can switch the API/UI to an unauthenticated mode.
-  #    Spellings verified against the Airflow 3.x config schema; the 2.x names
-  #    are kept alongside them per the version policy above.
-  - "api.auth_backends"         # airflow.api.auth.backend.default (Airflow 2.x)
-  - "fab.auth_backends"         # same option, moved to the FAB provider (3.x)
-  - "core.auth_manager"         # e.g. SimpleAuthManager
-  # core.auth_manager DEFAULTS to SimpleAuthManager, so these two are live in a
-  # stock deployment rather than only after someone opts in.
-  - "core.simple_auth_manager_all_admins"  # documented as "disable authentication"
-  - "core.simple_auth_manager_users"       # controls who can access the environment
-  - "webserver.expose_config"   # serves airflow.cfg through the UI (Airflow 2.x)
-  - "api.expose_config"         # same option, moved to [api] (3.x; masks secrets)
+  # Inherited by every section, including those above, so leaving it open would
+  # hand back everything they deny.
+  - "default"
 
-  # -- Task execution environment. Layer 1 only covers these while
-  #    airflow-kubernetes-executor is deployed and related; with no such
-  #    relation nothing else catches them, and they decide which image runs and
-  #    with which privileges. The spec abstract names this charm explicitly.
-  - "kubernetes_executor.pod_template_file"
-  - "kubernetes_executor.worker_container_repository"
-  - "kubernetes_executor.worker_container_tag"
+  # Authentication, in a section Airflow core does not own: `auth_backends`
+  # moved out to the FAB provider in 3.x, and can switch the UI to an
+  # unauthenticated mode.
+  - "fab.auth_backends"
