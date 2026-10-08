@@ -389,6 +389,31 @@ def test_shipped_denylist_blocks_the_sections_the_adr_names():
     ]
 
 
+def test_shipped_denylist_blocks_unrendered_worker_image_options():
+    """ADR 0001 decision 6: the gap Layer 1 does not cover.
+
+    The executor charm renders `namespace`, `pod_template_file` and
+    `base_image`, so Layer 1 drops those. It renders neither
+    `worker_container_repository` nor `worker_container_tag`, so without a
+    Layer 2 entry those two would reach airflow.cfg untouched and redirect
+    worker pods at an arbitrary image.
+    """
+    ini, _, dropped = denylist.apply_denylist(
+        "[kubernetes_executor]\n"
+        "worker_container_repository = evil.registry/airflow\n"
+        "worker_container_tag = latest\n\n"
+        "[gcs]\nconn_id = default_gcp\n",
+        {},
+    )
+
+    assert dropped == [
+        "kubernetes_executor.worker_container_repository",
+        "kubernetes_executor.worker_container_tag",
+    ]
+    assert "evil.registry" not in ini
+    assert "default_gcp" in ini
+
+
 def test_shipped_denylist_leaves_shared_provider_sections_alone():
     """Layer 2 guards Airflow's own sections, not every shared one.
 

@@ -1,17 +1,17 @@
 # ADR 0001: Scope of the Layer 2 provider configuration denylist
 
 - **Date:** 2026-10-07
-- **Spec:** WF029 sections 1.3.1, 3.1, 3.2.2 and 3.4
+- **Spec:** WF029 §§1.3.1, 3.1, 3.2.2 and 3.4
 - **Affects:** airflow-provider-configurator (`src/denylist.yaml`, `src/denylist.py`)
 
 ## Context
 
 This charm relays an unreviewed `.ini` file from git into the coordinator's
 `airflow.cfg`. WF029 section 3 guards it in two layers: **Layer 1** drops keys
-the coordinator currently renders (dynamic), **Layer 2** is this charm's short
-static denylist for what is out of bounds regardless.
+the coordinator currently renders (dynamic), while **Layer 2** is this charm's
+short static denylist for what is out of bounds regardless.
 
-WF029 3.2.2 seeds Layer 2 with one entry, `core.dags_folder`, and asks the team
+WF029 §3.2.2 seeds Layer 2 with one entry, `core.dags_folder`, and asks the team
 to review the list before implementation. This ADR is that review.
 
 The boundary is narrower than "providers only touch their own sections". The
@@ -39,20 +39,21 @@ in-charm defence would be circular.
 | `webserver` | 2.x alias Airflow 3.x still honours: `[webserver] secret_key` reads as `[api] secret_key` |
 | `default` | inherited by every section, including those above |
 | `fab.auth_backends` | can switch the UI to an unauthenticated mode |
+| `kubernetes_executor` | decides which image runs worker pods (decision 6) |
 
-Sections rather than options, because an option-level list ages badly: entries
-need re-verifying on every Airflow bump, and an option added later lands in an
-already-sensitive section uncovered. `[core]` is `[core]` across 3.x. The seed
-entry `core.dags_folder` is subsumed by `core`.
+Sections are denied rather than options, because an option-level list ages
+badly: entries need re-verifying on every Airflow bump, and an option added
+later lands in an already-sensitive section uncovered. The seed entry
+`core.dags_folder` is subsumed by `core`.
 
-This also denies benign tuning like `core.parallelism`, which is intended — per
-WF022 those are coordinator charm config options, not provider configuration.
+This also denies benign tuning such as `core.parallelism`, which is intended —
+per WF022 those are coordinator charm config options, not provider
+configuration.
 
-Two entries need justifying. `webserver`, because denying a section does *not*
-deny its deprecated alias: Airflow resolves the old spelling after this charm
-has seen the file. `fab.auth_backends` is the one option-level entry, because
-`auth_backends` moved to the FAB provider in 3.x and a provider may have
-legitimate `[fab]` settings.
+`webserver` is listed because denying a section does *not* deny its deprecated
+alias: Airflow resolves the old spelling after this charm has seen the file.
+`fab.auth_backends` is the one option-level entry, because `auth_backends` moved
+to the FAB provider in 3.x and a provider may have legitimate `[fab]` settings.
 
 ### 2. Layer 2 does not restate Layer 1
 
@@ -66,9 +67,7 @@ would reveal a Layer 1 regression.
 Three rules in `denylist.py` do work the list would otherwise do by enumeration:
 
 - **Case-insensitive, for section names as much as option names.** Airflow
-  lowercases both, so `[CORE] DAGS_FOLDER` is the same setting. `configparser`
-  preserves case on output (`optionxform = str`), so folding happens at
-  comparison time.
+  lowercases both, so `[CORE] DAGS_FOLDER` is the same setting.
 - **`_cmd` / `_secret` variants are implied** by the base option — Airflow
   resolves `_cmd` by running its value as a shell command. Layer 1 cannot cover
   these: the coordinator renders the bare option, so the variant collides with
@@ -77,88 +76,104 @@ Three rules in `denylist.py` do work the list would otherwise do by enumeration:
   inherited default from one section — `remove_option()` reports success while
   `write()` re-emits the value.
 
-Drops stay non-blocking (3.4), which is what makes a liberal list tolerable: an
+Drops stay non-blocking (§3.4), which is what makes a liberal list tolerable: an
 over-broad entry costs a warning, not a blocked unit.
 
-### 4. An unloadable denylist blocks, per 1.3 rather than 3.4
+### 4. An unloadable denylist blocks, per §1.3 rather than §3.4
 
-If `denylist.yaml` is missing, unreadable, invalid YAML, or has no non-empty
+If `denylist.yaml` is missing, unreadable, invalid YAML, or carries no non-empty
 `deny` list, the charm blocks instead of publishing.
 
-The file is static and ships inside the charm, so this is not reachable by an
-operator or by whoever writes the `.ini` — it is **not** a security control. The
-only way to produce it is a packaging regression that leaves the file out of the
-built charm. A bad edit is caught earlier, by the unit test that loads the real
-file.
+The file is static and ships inside the charm, so neither an operator nor
+whoever writes the `.ini` can reach it — this is **not** a security control. The
+only way to reach this state is a packaging regression that leaves the file out
+of the built charm, which the pack-time check in CI exists to catch. A bad edit
+is caught earlier still, by the unit test that loads the real file.
 
-That case is worth guarding because it is silent: every key would pass Layer 2,
-the unit would go Active, and nothing would indicate the validation had been
-skipped. Blocking is also not an exception to 3.4 — that section governs
-*violations*, and there is no offending key here. It is the class of a missing
-`file_path` (1.1), an undiscoverable `.ini` (1.3) or a secret collision (3.3),
-all of which block.
+The state is worth guarding against because it fails silently: every key would
+pass Layer 2, the unit would go Active, and nothing would indicate that
+validation had been skipped. Blocking is not an exception to §3.4 — that section
+governs *violations*, and there is no offending key here. It belongs with a
+missing `file_path` (§1.1), an undiscoverable `.ini` (§1.3) and a secret
+collision (§3.3), all of which block.
 
 ### 5. Changing a denied section is a charm release, not a runtime override
 
 A provider that genuinely needs a `[core]` option has three routes, preferred
-first: expose it as coordinator charm config (the WF022 pattern); or narrow the
-denylist entry to the options that actually matter, which is a `denylist.yaml`
-edit rather than a code change — the reason the list ships as data; or nothing,
-since a denied key is dropped, not fatal, and the deployment keeps running
-meanwhile.
+first:
+
+1. Expose it as coordinator charm config, following the WF022 pattern.
+2. Narrow the denylist entry to the options that actually matter. This is a
+   `denylist.yaml` edit rather than a code change — the reason the list ships as
+   data.
+3. Do nothing, since a denied key is dropped rather than fatal, and the
+   deployment keeps running meanwhile.
 
 A config option to override the denylist is deliberately not offered: it would
-hand the bypass to whoever writes the `.ini`, the party Layer 2 constrains.
+hand the bypass to whoever writes the `.ini`, the very party Layer 2 constrains.
+
+### 6. `kubernetes_executor` is denied, because Layer 1 does not cover it
+
+It would be reasonable to assume that while the executor is in use its section
+is rendered, and that Layer 1 therefore drops its options. Checked against the
+coordinator and executor charm sources, that holds for only part of the section:
+
+| Option | Rendered by the executor charm? |
+|---|---|
+| `namespace` | yes |
+| `pod_template_file` | yes |
+| `base_image` | yes |
+| `worker_container_repository` | **no** |
+| `worker_container_tag` | **no** |
+
+Layer 1 drops what the coordinator renders, so the last two reach Layer 2
+uncovered — and both help determine which image runs worker pods.
+
+Denying the section costs nothing for the three rendered options, since Layer 1
+already drops them. It repeats the `core` pattern: that section is denied
+wholesale even though `core.fernet_key` and `core.executor` are rendered, so
+section-level denial already overlaps Layer 1 wherever the section as a whole is
+out of bounds. Decision 2 rules out denying a *rendered option* for its own
+sake, which this is not.
+
+Section-level denial also settles the question once for every option the section
+gains later, rather than once per Airflow release.
 
 ## Consequences
 
-- Six entries, reviewable at a glance, as 3.2.2 assumes. No update needed when
-  Airflow adds options to `[core]`, `[api]` or `[dag_processor]`.
-- One-sentence boundary: *Airflow's own configuration goes through the
-  coordinator; everything else is yours.*
-- **A provider cannot set anything in `[core]`, `[api]`, `[dag_processor]` or
-  `[webserver]`.** Recovery is a charm release (decision 5); non-fatal meanwhile.
+- Seven entries, reviewable at a glance, as §3.2.2 assumes. No update is needed
+  when Airflow adds options to `[core]`, `[api]` or `[dag_processor]`.
+- **A provider cannot set anything in `[core]`, `[api]`, `[dag_processor]`,
+  `[webserver]` or `[kubernetes_executor]`.** Recovery is a charm release
+  (decision 5), and the deployment keeps running meanwhile.
 - **A denied section can drop many keys at once**, so Juju may truncate the
   status message. The log is complete; the status may not be.
 
 ## Open question
 
-**Executor sections — needs a decision before Layer 2 ships.**
+**Other executors, once they are supported.** Only `KubernetesExecutor` ships
+today. `[celery]`, `[local_kubernetes_executor]` and
+`[celery_kubernetes_executor]` are rendered by neither charm and are not denied.
+Decision 6 was reached by checking one executor's render set, so adding an
+executor means repeating that check rather than inheriting the answer.
 
-`[kubernetes_executor] pod_template_file`, `worker_container_repository` and
-`worker_container_tag` decide which image runs worker pods. The section is not
-denied, on the argument that `core.executor` is denied and that while the
-executor is in use the coordinator renders the section, so Layer 1 covers it.
-
-That rests on another charm's implementation detail, and holds only if the
-coordinator renders the *complete* set of image-determining options. It is also
-shaped by today's support matrix and does not generalise — every executor added
-later brings the same question.
-
-Two ways to close it:
-
-1. **Deny executor sections as a class.** Unilateral and cheap, answering it
-   once instead of per executor. Cost: moves `[celery]` out of the "shared
-   sections a provider may write to" set, which needs stating explicitly.
-2. **Verify and pin the coordinator's render set**, so Layer 1 provably covers
-   them. Correct, but a cross-team dependency that leaves the gap open until it
-   lands.
-
-Until one is done, the gap is live.
+Denying executor sections as a class would settle it in advance, but `[celery]`
+carries ordinary tuning a provider may have reason to set, so that would mean
+guessing at a charm that does not yet exist.
 
 ## Alternatives considered
 
 - **Enumerate individual options,** as the seed entry does. Open-ended,
-  release-specific, duplicates Layer 1. Rejected.
+  release-specific and duplicates Layer 1. Rejected.
 - **Deny every section the coordinator renders, derived from WF022.** That is
-  Layer 1, computed statically and so permanently at risk of drifting. Rejected.
+  Layer 1 computed statically, and so permanently at risk of drifting. Rejected.
 - **Allow-list the sections a provider may write to.** Already rejected by the
   spec (§3.1): the set grows with every provider installed, and scoping it to a
   provider's own sections breaks the pattern §1.3.1 documents.
 
 ## Out of scope
 
-- **Validating option *values*.** Layer 2 decides whether a key may be set, never
-  what it may be set to.
+- **Validating option *values*.** Layer 2 decides whether a key may be set,
+  never what it may be set to.
 - **Remaining deprecated aliases.** `webserver` covers the one with real
   consequences; a full alias table would need tracking across releases.

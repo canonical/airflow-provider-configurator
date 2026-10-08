@@ -30,6 +30,14 @@ deny:
   # hand back everything they deny.
   - "default"
 
+  # Decides which image runs worker pods. The executor charm renders
+  # `namespace`, `pod_template_file` and `base_image`, so Layer 1 drops those,
+  # but it renders neither `worker_container_repository` nor
+  # `worker_container_tag` -- verified in the executor charm source. Those two
+  # are image-determining and reach Layer 2 uncovered, so the section is denied
+  # wholesale rather than per-option; see ADR 0001 decision 6.
+  - "kubernetes_executor"
+
   # Authentication, in a section Airflow core does not own: `auth_backends`
   # moved out to the FAB provider in 3.x, and can switch the UI to an
   # unauthenticated mode.
