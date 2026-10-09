@@ -21,6 +21,22 @@ deny:
   - "api" # API/UI exposure, session signing, expose_config
   - "dag_processor" # DAG bundle configuration, i.e. where DAG code is fetched from
 
+  # JWT validation for the API. The coordinator's template renders only
+  # `jwt_secret`, so every other option in the section reaches Layer 2
+  # uncovered -- and they govern how tokens are signed and accepted, which
+  # decides whether API authentication can be bypassed. Same reasoning as
+  # `kubernetes_executor`; see ADR 0001 decision 6.
+  - "api_auth"
+
+  # The metadata database. The coordinator renders 2 of this section's 19
+  # options, so 17 reach Layer 2 uncovered. Three of them --
+  # `sql_alchemy_connect_args`, `sql_alchemy_connect_args_async` and
+  # `sql_alchemy_session_maker` -- are read with `conf.getimport()` in
+  # airflow/settings.py, which imports the named module at startup; setting one
+  # is arbitrary code execution, not configuration. `sql_alchemy_conn_async` is
+  # a second DSN that neither charm renders.
+  - "database"
+
   # Airflow 3.x still honours some 2.x section names, and denying the new
   # spelling does NOT deny the alias: `[webserver] secret_key` is still read as
   # `[api] secret_key`. No provider has a reason to write here either way.

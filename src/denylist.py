@@ -48,12 +48,13 @@ class DenylistUnavailableError(Exception):
     """
 
 
-def load_denylist(path: Path = DENYLIST_PATH) -> frozenset[str]:
+def load_denylist(path: Path | None = None) -> frozenset[str]:
     """Return the set of denied entries from the denylist file.
 
     Args:
-        path: location of the denylist YAML. Defaults to the one shipped next to
-            this module; overridable for testing.
+        path: location of the denylist YAML. Defaults to the shipped one,
+            resolved at call time so tests can patch ``DENYLIST_PATH``; a
+            default argument would bind it at import and ignore the patch.
 
     Returns:
         A frozenset of entries, each either a bare ``"section"`` or a
@@ -61,10 +62,11 @@ def load_denylist(path: Path = DENYLIST_PATH) -> frozenset[str]:
 
     Raises:
         DenylistUnavailableError: if the file is missing, unreadable, not valid
-            YAML, or carries no non-empty ``deny`` list. The denylist ships with
-            the charm, so any of these means the deployed charm is broken rather
-            than that Layer 2 was meant to be switched off.
+            YAML, or has no non-empty ``deny`` list. The denylist ships with the
+            charm, so any of these means a broken charm, not Layer 2 switched
+            off.
     """
+    path = DENYLIST_PATH if path is None else path
     try:
         data = yaml.safe_load(path.read_text())
     except (OSError, yaml.YAMLError) as e:

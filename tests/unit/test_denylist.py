@@ -414,6 +414,74 @@ def test_shipped_denylist_blocks_unrendered_worker_image_options():
     assert "default_gcp" in ini
 
 
+def test_shipped_denylist_blocks_unrendered_api_auth_options():
+    """ADR 0001 decision 6, the second partially rendered section.
+
+    The coordinator renders one line of [api_auth], `jwt_secret`. The rest of
+    the section reaches Layer 2 uncovered and decides how API tokens are signed
+    and accepted. The options below are representative, not exhaustive: the
+    entry denies the section.
+    """
+    ini, _, dropped = denylist.apply_denylist(
+        "[api_auth]\n"
+        "jwt_secret = attacker-signing-key\n"
+        "jwt_algorithm = none\n"
+        "jwt_issuer = evil\n\n"
+        "[gcs]\nconn_id = default_gcp\n",
+        {},
+    )
+
+    assert dropped == [
+        "api_auth.jwt_algorithm",
+        "api_auth.jwt_issuer",
+        "api_auth.jwt_secret",
+    ]
+    assert "attacker-signing-key" not in ini
+    assert "default_gcp" in ini
+
+
+def test_shipped_denylist_blocks_unrendered_database_options():
+    """ADR 0001 decision 6, the third partially rendered section.
+
+    The coordinator renders 2 of 19 options. `sql_alchemy_session_maker` and
+    the `connect_args` pair are read with `conf.getimport()` in
+    airflow/settings.py, so setting one imports an arbitrary module at startup;
+    `sql_alchemy_conn_async` is a second DSN.
+    """
+    ini, _, dropped = denylist.apply_denylist(
+        "[database]\n"
+        "sql_alchemy_conn = postgresql://attacker@evil.example.com:5432/pwned\n"
+        "sql_alchemy_conn_async = postgresql+asyncpg://attacker@evil.example.com/pwned\n"
+        "sql_alchemy_connect_args = evil.module.connect_args\n"
+        "sql_alchemy_session_maker = evil.module.session_maker\n\n"
+        "[gcs]\nconn_id = default_gcp\n",
+        {},
+    )
+
+    assert dropped == [
+        "database.sql_alchemy_conn",
+        "database.sql_alchemy_conn_async",
+        "database.sql_alchemy_connect_args",
+        "database.sql_alchemy_session_maker",
+    ]
+    assert "evil.example.com" not in ini
+    assert "evil.module" not in ini
+    assert "default_gcp" in ini
+
+
+def test_load_denylist_honours_a_patched_module_path(tmp_path, monkeypatch):
+    """``DENYLIST_PATH`` is resolved at call time, not bound as a default.
+
+    A default argument would bind the shipped path at import, so this patch
+    would be a silent no-op and the test would pass for the wrong reason.
+    """
+    stand_in = tmp_path / "denylist.yaml"
+    stand_in.write_text('deny: ["sentinel.entry"]\n')
+    monkeypatch.setattr(denylist, "DENYLIST_PATH", stand_in)
+
+    assert denylist.load_denylist() == frozenset({"sentinel.entry"})
+
+
 def test_shipped_denylist_leaves_shared_provider_sections_alone():
     """Layer 2 guards Airflow's own sections, not every shared one.
 

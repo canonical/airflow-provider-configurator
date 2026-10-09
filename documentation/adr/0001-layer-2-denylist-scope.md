@@ -36,6 +36,8 @@ in-charm defence would be circular.
 | `core` | DAG and plugin paths, `executor`, deserialization allow-lists, `auth_manager`, `fernet_key` |
 | `api` | API/UI exposure, `expose_config`, session signing |
 | `dag_processor` | where DAG code is fetched from |
+| `api_auth` | JWT signing and validation for the API (decision 6) |
+| `database` | metadata DB connection, and SQLAlchemy hooks Airflow imports (decision 6) |
 | `webserver` | 2.x alias Airflow 3.x still honours: `[webserver] secret_key` reads as `[api] secret_key` |
 | `default` | inherited by every section, including those above |
 | `fab.auth_backends` | can switch the UI to an unauthenticated mode |
@@ -57,10 +59,12 @@ to the FAB provider in 3.x and a provider may have legitimate `[fab]` settings.
 
 ### 2. Layer 2 does not restate Layer 1
 
-`core.fernet_key`, `core.executor`, `api.secret_key` and
-`database.sql_alchemy_conn` are rendered by the coordinator, so Layer 1 already
-drops them. Denying them twice adds no defence and removes the only signal that
-would reveal a Layer 1 regression.
+`core.fernet_key`, `core.executor` and `api.secret_key` are rendered by the
+coordinator, so Layer 1 already drops them. Denying them twice adds no defence
+and removes the only signal that would reveal a Layer 1 regression.
+
+This applies to an option in isolation. Where a *section* is partially
+rendered, decision 6 governs instead.
 
 ### 3. Matching stays liberal, so the list can stay small
 
@@ -112,40 +116,53 @@ first:
 A config option to override the denylist is deliberately not offered: it would
 hand the bypass to whoever writes the `.ini`, the very party Layer 2 constrains.
 
-### 6. `kubernetes_executor` is denied, because Layer 1 does not cover it
+### 6. A partially rendered section is denied whole
 
-It would be reasonable to assume that while the executor is in use its section
-is rendered, and that Layer 1 therefore drops its options. Checked against the
-coordinator and executor charm sources, that holds for only part of the section:
+It would be reasonable to assume that a section the coordinator renders is
+covered by Layer 1. That holds only for the options actually rendered. Three
+sections are rendered in part, checked against the coordinator and executor
+charm sources and against Airflow's own `config.yml`:
 
-| Option | Rendered by the executor charm? |
-|---|---|
-| `namespace` | yes |
-| `pod_template_file` | yes |
-| `base_image` | yes |
-| `worker_container_repository` | **no** |
-| `worker_container_tag` | **no** |
+| Section | Rendered | Not rendered |
+|---|---|---|
+| `kubernetes_executor` | `namespace`, `pod_template_file`, `base_image` | `worker_container_repository`, `worker_container_tag` |
+| `api_auth` | `jwt_secret` | everything else in the section |
+| `database` | `sql_alchemy_conn`, `sql_alchemy_pool_size` | the other 17 of 19 options |
 
-Layer 1 drops what the coordinator renders, so the last two reach Layer 2
-uncovered — and both help determine which image runs worker pods.
+Layer 1 drops what the coordinator renders, so the rest reach Layer 2
+uncovered. In `kubernetes_executor` those options help determine which image
+runs worker pods; in `api_auth` they govern how API tokens are signed and
+accepted, so control over them is control over whether API authentication can
+be bypassed.
 
-Denying the section costs nothing for the three rendered options, since Layer 1
+`database` is the clearest case. Three of its uncovered options --
+`sql_alchemy_connect_args`, `sql_alchemy_connect_args_async` and
+`sql_alchemy_session_maker` -- are read with `conf.getimport()` in
+`airflow/settings.py`, which imports the named module in every Airflow process
+at startup. Setting one is arbitrary code execution rather than configuration;
+Airflow's own description of `sql_alchemy_session_maker` opens "Important
+Warning: Use of sql_alchemy_session_maker Highly Discouraged". The section also
+carries `sql_alchemy_conn_async`, a second DSN that neither charm renders, so
+the database connection was reachable independently of `sql_alchemy_conn`.
+
+Denying each section whole costs nothing for the rendered options, since Layer 1
 already drops them. It repeats the `core` pattern: that section is denied
 wholesale even though `core.fernet_key` and `core.executor` are rendered, so
 section-level denial already overlaps Layer 1 wherever the section as a whole is
 out of bounds. Decision 2 rules out denying a *rendered option* for its own
 sake, which this is not.
 
-Section-level denial also settles the question once for every option the section
+Section-level denial also settles the question once for every option a section
 gains later, rather than once per Airflow release.
 
 ## Consequences
 
-- Seven entries, reviewable at a glance, as §3.2.2 assumes. No update is needed
+- Nine entries, reviewable at a glance, as §3.2.2 assumes. No update is needed
   when Airflow adds options to `[core]`, `[api]` or `[dag_processor]`.
 - **A provider cannot set anything in `[core]`, `[api]`, `[dag_processor]`,
-  `[webserver]` or `[kubernetes_executor]`.** Recovery is a charm release
-  (decision 5), and the deployment keeps running meanwhile.
+  `[webserver]`, `[api_auth]`, `[database]` or `[kubernetes_executor]`.**
+  Recovery is a charm release (decision 5), and the deployment keeps running
+  meanwhile.
 - **A denied section can drop many keys at once**, so Juju may truncate the
   status message. The log is complete; the status may not be.
 
@@ -160,6 +177,15 @@ executor means repeating that check rather than inheriting the answer.
 Denying executor sections as a class would settle it in advance, but `[celery]`
 carries ordinary tuning a provider may have reason to set, so that would mean
 guessing at a charm that does not yet exist.
+
+**`[scheduler]` and `[triggerer]` are partially rendered but not denied.** The
+coordinator renders one option in each, `enable_healthcheck` and `capacity`, so
+by decision 6 they qualify. They are left open because their uncovered
+remainder is ordinary tuning rather than anything that decides what code runs,
+where it is fetched from, or who is authenticated. That is a severity judgement
+rather than a principle, and the team may prefer consistency over it: denying
+both would cost nothing to a provider with no legitimate reason to tune the
+scheduler.
 
 ## Alternatives considered
 
