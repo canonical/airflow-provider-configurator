@@ -76,6 +76,19 @@ jobs:
           channel: 4.x/stable
           verbosity: trace
 
+      # denylist.yaml is the only non-Python file src/ needs at runtime, so it
+      # is the one thing a packaging change could silently drop. Without it the
+      # charm cannot enforce Layer 2 at all, so catch it here rather than at
+      # deploy time.
+      - name: Check the denylist ships in the charm
+        run: |
+          charm=$(ls ./*.charm)
+          if ! unzip -l "$charm" | grep -q 'src/denylist.yaml'; then
+            echo "::error::src/denylist.yaml is missing from $charm; Layer 2 cannot be enforced"
+            exit 1
+          fi
+          echo "src/denylist.yaml is present in $charm"
+
       - name: Upload charm artifact
         uses: actions/upload-artifact@v7
         with:

@@ -1,0 +1,60 @@
+# Layer 2 denylist -- spec WF029 section 3.2.2.
+#
+# An entry is either a whole section (`core`) or a single option
+# (`fab.auth_backends`). Matching is case-insensitive, and a denied option also
+# covers its `_cmd` / `_secret` variants; see denylist.py.
+#
+# Airflow 3.x spellings only. This charm does not support Airflow 2.x, so 2.x
+# names such as `webserver.expose_config` are deliberately absent.
+#
+# This list is deliberately short, and it does NOT restate what the
+# coordinator's dynamic Layer 1 collision detection already catches. The
+# reasoning, and what it leaves open, is in
+# documentation/adr/0001-layer-2-denylist-scope.md. Read that before adding an
+# entry.
+deny:
+  # Sections Airflow's own machinery owns. A provider may legitimately write to
+  # plenty of shared sections -- `[secrets]`, `[logging]` -- but not to these.
+  # Denying them wholesale is shorter to review than an option-by-option list,
+  # and stays correct when a future Airflow release adds options to them.
+  - "core" # DAG and plugin paths, executor, deserialization, auth manager, fernet key
+  - "api" # API/UI exposure, session signing, expose_config
+  - "dag_processor" # DAG bundle configuration, i.e. where DAG code is fetched from
+
+  # JWT validation for the API. The coordinator's template renders only
+  # `jwt_secret`, so every other option in the section reaches Layer 2
+  # uncovered -- and they govern how tokens are signed and accepted, which
+  # decides whether API authentication can be bypassed. Same reasoning as
+  # `kubernetes_executor`; see ADR 0001 decision 6.
+  - "api_auth"
+
+  # The metadata database. The coordinator renders 2 of this section's 19
+  # options, so 17 reach Layer 2 uncovered. Three of them --
+  # `sql_alchemy_connect_args`, `sql_alchemy_connect_args_async` and
+  # `sql_alchemy_session_maker` -- are read with `conf.getimport()` in
+  # airflow/settings.py, which imports the named module at startup; setting one
+  # is arbitrary code execution, not configuration. `sql_alchemy_conn_async` is
+  # a second DSN that neither charm renders.
+  - "database"
+
+  # Airflow 3.x still honours some 2.x section names, and denying the new
+  # spelling does NOT deny the alias: `[webserver] secret_key` is still read as
+  # `[api] secret_key`. No provider has a reason to write here either way.
+  - "webserver"
+
+  # Inherited by every section, including those above, so leaving it open would
+  # hand back everything they deny.
+  - "default"
+
+  # Decides which image runs worker pods. The executor charm renders
+  # `namespace`, `pod_template_file` and `base_image`, so Layer 1 drops those,
+  # but it renders neither `worker_container_repository` nor
+  # `worker_container_tag` -- verified in the executor charm source. Those two
+  # are image-determining and reach Layer 2 uncovered, so the section is denied
+  # wholesale rather than per-option; see ADR 0001 decision 6.
+  - "kubernetes_executor"
+
+  # Authentication, in a section Airflow core does not own: `auth_backends`
+  # moved out to the FAB provider in 3.x, and can switch the UI to an
+  # unauthenticated mode.
+  - "fab.auth_backends"

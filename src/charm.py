@@ -18,6 +18,7 @@ reads the synced .ini, combines it with sensitive data from the user secret, and
 publishes the configuration.
 """
 
+import configparser
 import hashlib
 import http.client
 import json
@@ -32,12 +33,16 @@ import ops
 from airflow_provider_configurator import AirflowProviderConfiguratorProvides
 
 import config_generator
+import denylist
 import sensitive_config
 from constants import (
     CONFIG_FILE_PATH,
     CONFIG_SENSITIVE_SECRET,
     CONFIG_SYNC_PERIOD,
     CONTENT_SYNCED_NOTICE_KEY,
+    DENYLIST_DROP_LOG,
+    DENYLIST_UNAVAILABLE_MESSAGE,
+    DROPPED_PROVIDER_CONFIG_MESSAGE,
     ESCAPING_FILE_PATH_MESSAGE,
     EXECHOOK_SCRIPT_PATH,
     GIT_RELATION_NAME,
@@ -52,6 +57,7 @@ from constants import (
     GIT_SYNC_SERVICE,
     GIT_SYNC_SIGNAL,
     INVALID_GIT_RELATION_MESSAGE,
+    MALFORMED_CONFIG_FILE_MESSAGE,
     MISSING_FILE_PATH_MESSAGE,
     MISSING_GIT_RELATION_MESSAGE,
     MISSING_SENSITIVE_KEY_MESSAGE,
@@ -99,6 +105,11 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         self._container = self.unit.get_container(WORKLOAD_CONTAINER)
         self._sync_period = str(self.config[CONFIG_SYNC_PERIOD])
         self._config_provider = AirflowProviderConfiguratorProvides(self)
+
+        # Layer 2 keys dropped during this hook, recorded in _publish_configuration
+        # (before the content-hash dedup) so the status still reflects them on a
+        # deduped reconcile. Reset per hook; one charm instance per Juju event.
+        self._dropped_keys: list[str] = []
 
         # GitRequires(callback=...) already observes git_connection_information_updated,
         # relation_joined and relation_broken, so those are not repeated here.
@@ -284,8 +295,21 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
             logger.error(e)
             self.unit.status = e.status
             return e.message
-        self.unit.status = ops.ActiveStatus()
+        self.unit.status = self._reconciled_status()
         return None
+
+    def _reconciled_status(self) -> ops.StatusBase:
+        """The Active status for a converged unit, noting any Layer 2 drops.
+
+        Non-blocking (spec 3.4): the unit stays Active, but when provider
+        configuration was dropped by the denylist the message names the dropped
+        keys so the operator sees it without reading the logs.
+        """
+        if self._dropped_keys:
+            return ops.ActiveStatus(
+                DROPPED_PROVIDER_CONFIG_MESSAGE.format(keys=", ".join(self._dropped_keys))
+            )
+        return ops.ActiveStatus()
 
     def _on_secret_changed(self, event: ops.SecretChangedEvent) -> None:
         """Reconcile, forcing the publish past the content-hash dedup.
@@ -403,14 +427,37 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
                 the content is unchanged.
 
         Raises:
-            ExitWithStatusError: if the file is missing, or the sensitive
-                secret is set but unreadable / invalid / has a collision.
+            ExitWithStatusError: if the file is missing or cannot be parsed as
+                INI, the sensitive secret is set but unreadable / invalid / has
+                a collision, or the denylist itself cannot be loaded.
         """
         ini_content = self._read_synced_file()
         sensitive_data = self._sensitive_data()
-        template, flat_sensitive = config_generator.build_template_and_secrets(
-            ini_content, sensitive_data=sensitive_data
-        )
+        # Layer 2 validation (spec 3.2.2): drop statically-denied keys from both
+        # inputs before building the template. Recorded here -- ahead of the
+        # content-hash dedup below -- so the dropped-keys status is set on every
+        # reconcile, including the deduped ones that return early.
+        #
+        # Both calls parse the INI, so a file configparser rejects is caught
+        # here. A file that cannot be parsed is an authoring mistake, exactly
+        # like a missing one (spec 1.3): block and wait for the next sync,
+        # rather than letting the hook error out and have Juju retry forever.
+        try:
+            ini_content, sensitive_data, dropped = denylist.apply_denylist(
+                ini_content, sensitive_data
+            )
+            template, flat_sensitive = config_generator.build_template_and_secrets(
+                ini_content, sensitive_data=sensitive_data
+            )
+        except configparser.Error as e:
+            raise ExitWithStatusError(MALFORMED_CONFIG_FILE_MESSAGE, ops.BlockedStatus) from e
+        except denylist.DenylistUnavailableError as e:
+            # Spec 3.4 governs violations; there is no offending key here, so it
+            # does not apply. Treated like a missing config file (spec 1.3):
+            # publishing would skip Layer 2 entirely with nothing to say so.
+            logger.error("Layer 2 denylist unavailable: %s", e)
+            raise ExitWithStatusError(DENYLIST_UNAVAILABLE_MESSAGE, ops.BlockedStatus) from e
+        self._record_dropped_keys(dropped)
 
         config_hash = self._config_hash(template, self._sensitive_secret_id)
         is_empty = not template and not flat_sensitive
@@ -439,6 +486,17 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
                 provider_configuration_sensitive_data=flat_sensitive,
             )
         self._store_config_hash(config_hash)
+
+    def _record_dropped_keys(self, dropped: list[str]) -> None:
+        """Record Layer 2 drops for this hook and log a WARNING per dropped key.
+
+        Stored on the instance so _reconciled_status can surface a non-blocking
+        status message even when the publish is deduped away (spec 3.4). A WARNING
+        is logged for each key naming it and the layer that caught it.
+        """
+        self._dropped_keys = dropped
+        for key in dropped:
+            logger.warning(DENYLIST_DROP_LOG, key)
 
     @staticmethod
     def _config_hash(template: str, sensitive_secret_id: str | None) -> str:
