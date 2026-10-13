@@ -43,7 +43,11 @@ deny:
   - "webserver"
 
   # Inherited by every section, including those above, so leaving it open would
-  # hand back everything they deny.
+  # hand back everything they deny. Load-bearing in a second, less obvious way:
+  # a whole-section entry contributes nothing to the [DEFAULT] option check (see
+  # `_denied_option_names`), so `[DEFAULT] worker_container_tag` is caught by
+  # this entry rather than by `kubernetes_executor`. Narrowing this to specific
+  # options would silently stop covering [DEFAULT].
   - "default"
 
   # Decides which image runs worker pods. The executor charm renders

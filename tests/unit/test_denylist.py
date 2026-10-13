@@ -482,6 +482,23 @@ def test_load_denylist_honours_a_patched_module_path(tmp_path, monkeypatch):
     assert denylist.load_denylist() == frozenset({"sentinel.entry"})
 
 
+def test_shipped_denylist_denies_the_default_section():
+    """The shipped list carries `default`, not just the matching logic for it.
+
+    [DEFAULT] is inherited by every section, so leaving it open hands back
+    everything the other entries deny: `[DEFAULT] dags_folder` reaches [core]
+    anyway. Asserted against the shipped file rather than a fixture, because the
+    mechanism was already covered by one and deleting the entry broke no test.
+    """
+    filtered_ini, _, dropped = denylist.apply_denylist(
+        "[DEFAULT]\ndags_folder = /tmp/evil\n\n[gcs]\nconn_id = default_gcp\n", {}
+    )
+
+    assert dropped == ["DEFAULT.dags_folder"]
+    assert "/tmp/evil" not in filtered_ini
+    assert "default_gcp" in filtered_ini
+
+
 def test_shipped_denylist_leaves_shared_provider_sections_alone():
     """Layer 2 guards Airflow's own sections, not every shared one.
 
@@ -710,9 +727,8 @@ def test_denylist_unavailable_blocks_instead_of_publishing(context, tmp_path, mo
     configuration. This is the guard itself failing, which is a charm fault, so
     it gets the same treatment as a missing config file (spec 1.3).
 
-    load_denylist is patched rather than DENYLIST_PATH: the path is a default
-    argument, bound when the function is defined, so rebinding the module
-    attribute would not reach it. What the loader rejects is covered directly by
+    load_denylist is patched rather than DENYLIST_PATH to keep this test about
+    the charm's response. What the loader itself rejects is covered directly by
     the test_load_denylist_fails_closed cases.
     """
 
