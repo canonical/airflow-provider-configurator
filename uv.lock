@@ -10,6 +10,7 @@ dependencies = [
     { name = "airflow-provider-configurator-charmlib" },
     { name = "ops" },
     { name = "pydantic" },
+    { name = "pyyaml" },
 ]
 
 [package.dev-dependencies]
@@ -36,6 +37,7 @@ requires-dist = [
     { name = "airflow-provider-configurator-charmlib", directory = "lib" },
     { name = "ops", specifier = ">=3,<4" },
     { name = "pydantic", specifier = ">=2" },
+    { name = "pyyaml", specifier = ">=6" },
 ]
 
 [package.metadata.requires-dev]
