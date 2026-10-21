@@ -138,14 +138,73 @@ def _credentials_relation(pat_secret):
     )
 
 
-def _ssh_relation():
-    """A git relation using SSH auth (not supported yet)."""
-    return ops.testing.Relation(
-        GIT_RELATION,
-        interface="git",
-        remote_app_data={
-            "repository-url": "git@github.com:example/private.git",
-            "authentication-method": git.AuthenticationMethodEnum.SSH.value,
+def _ssh_relation(
+    ssh_key_secret=None,
+    *,
+    url="git@github.com:example/private.git",
+    strict=None,
+    port=None,
+    passphrase_secret=None,
+):
+    """A git relation using SSH auth.
+
+    ``ssh_key_secret`` supplies the private key (as git-integrator would, via a
+    Juju secret); omit it to model SSH selected without a key. ``strict``/``port``
+    set the host-key-checking and port fields; ``passphrase_secret`` adds a
+    passphrase, which the charm refuses.
+    """
+    data = {
+        "repository-url": url,
+        "authentication-method": git.AuthenticationMethodEnum.SSH.value,
+    }
+    if ssh_key_secret is not None:
+        data["secret-ssh-private-key"] = ssh_key_secret.id
+    if strict is not None:
+        data["ssh-strict-host-key-checking"] = "true" if strict else "false"
+    if port is not None:
+        data["ssh-port"] = str(port)
+    if passphrase_secret is not None:
+        data["secret-ssh-passphrase"] = passphrase_secret.id
+    return ops.testing.Relation(GIT_RELATION, interface="git", remote_app_data=data)
+
+
+# The secret content key git-integrator uses for the SSH private key / passphrase.
+SSH_KEY_SECRET_KEY = "ssh-private-key"
+SSH_PASSPHRASE_SECRET_KEY = "ssh-passphrase"
+
+# A representative ssh-keyscan line, returned by the mocked exec in SSH tests.
+KEYSCAN_OUTPUT = "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexamplekeydata\n"
+
+
+SSH_PRIVATE_KEY = "-----BEGIN OPENSSH PRIVATE KEY-----\nabc123\n-----END OPENSSH PRIVATE KEY-----"
+
+
+@pytest.fixture
+def ssh_key_secret():
+    return ops.testing.Secret({SSH_KEY_SECRET_KEY: SSH_PRIVATE_KEY})
+
+
+def _ssh_synced_container(
+    tmp_path, *, keyscan_stdout=KEYSCAN_OUTPUT, keyscan_rc=0, creds_dir=None
+):
+    """A git-sync container with a synced .ini and a mocked ``ssh-keyscan``.
+
+    ``creds_dir`` mounts a host directory at the SSH credentials location, so a
+    test can pre-seed (and then inspect) the key / known_hosts files.
+    """
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    (repo_dir / "providers.ini").write_text(SAMPLE_INI)
+    mounts = {"content": ops.testing.Mount(location="/git/repo", source=repo_dir)}
+    if creds_dir is not None:
+        creds_mount_point = charm_module.GIT_SYNC_SSH_KEY_FILE.rsplit("/", 1)[0]
+        mounts["creds"] = ops.testing.Mount(location=creds_mount_point, source=creds_dir)
+    return ops.testing.Container(
+        name="git-sync",
+        can_connect=True,
+        mounts=mounts,
+        execs={
+            ops.testing.Exec(["ssh-keyscan"], return_code=keyscan_rc, stdout=keyscan_stdout),
         },
     )
 
@@ -342,9 +401,7 @@ class TestReconcile:
         )
         state_out = context.run(context.on.relation_changed(relation), state)
 
-        assert state_out.unit_status == ops.BlockedStatus(
-            charm_module.ESCAPING_FILE_PATH_MESSAGE
-        )
+        assert state_out.unit_status == ops.BlockedStatus(charm_module.ESCAPING_FILE_PATH_MESSAGE)
         # Nothing was published, so the credential never reached the coordinator.
         out_provider = state_out.get_relation(provider_relation.id)
         assert "provider-configuration" not in out_provider.local_app_data
@@ -371,9 +428,7 @@ class TestReconcile:
             config={FILE_PATH_CONFIG: "password"},
         )
         state_out = context.run(context.on.relation_changed(git_relation), state)
-        assert state_out.unit_status == ops.BlockedStatus(
-            charm_module.ESCAPING_FILE_PATH_MESSAGE
-        )
+        assert state_out.unit_status == ops.BlockedStatus(charm_module.ESCAPING_FILE_PATH_MESSAGE)
 
     def test_blocked_when_file_path_is_absolute(self, context, synced_container):
         """An absolute file path is rejected rather than silently re-anchored."""
@@ -385,9 +440,7 @@ class TestReconcile:
             config={FILE_PATH_CONFIG: "/etc/passwd"},
         )
         state_out = context.run(context.on.relation_changed(git_relation), state)
-        assert state_out.unit_status == ops.BlockedStatus(
-            charm_module.ESCAPING_FILE_PATH_MESSAGE
-        )
+        assert state_out.unit_status == ops.BlockedStatus(charm_module.ESCAPING_FILE_PATH_MESSAGE)
 
     def test_https_auth_sets_username_and_writes_password_file(
         self, context, synced_container, pat_secret
@@ -482,9 +535,211 @@ class TestReconcile:
         # shlex.join quotes the value so the injected flag stays part of --ref.
         assert "--exechook-command" not in shlex.split(service.command)
 
-    def test_blocked_on_ssh_auth(self, context, container):
-        """SSH auth is not supported yet -> BlockedStatus."""
-        relation = _ssh_relation()
+    def test_ssh_auth_writes_key_and_configures_git_sync(self, context, tmp_path, ssh_key_secret):
+        """SSH auth -> key written, SSH flags set, known_hosts scanned, config published."""
+        relation = _ssh_relation(ssh_key_secret)
+        provider_relation = _provider_relation()
+        state = ops.testing.State(
+            leader=True,
+            containers=[_ssh_synced_container(tmp_path)],
+            relations=[relation, provider_relation],
+            secrets=[ssh_key_secret],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        state_out = context.run(context.on.relation_changed(relation), state)
+        assert state_out.unit_status == ops.ActiveStatus()
+
+        out_container = state_out.get_container("git-sync")
+        service = out_container.layers["git-sync"].services["git-sync"]
+        assert f"--ssh-key-file={charm_module.GIT_SYNC_SSH_KEY_FILE}" in service.command
+        assert "--add-user" in service.command
+        # Strict checking defaults on: a known_hosts file is used, not disabled.
+        known_hosts_flag = f"--ssh-known-hosts-file={charm_module.GIT_SYNC_KNOWN_HOSTS_FILE}"
+        assert known_hosts_flag in service.command
+        assert "--ssh-known-hosts=false" not in service.command
+
+        # The key (with a trailing newline) and the scanned known_hosts are on disk.
+        container_root = out_container.get_filesystem(context)
+        key_file = container_root / charm_module.GIT_SYNC_SSH_KEY_FILE.lstrip("/")
+        assert key_file.read_text().endswith("-----END OPENSSH PRIVATE KEY-----\n")
+        known_hosts = container_root / charm_module.GIT_SYNC_KNOWN_HOSTS_FILE.lstrip("/")
+        assert known_hosts.read_text() == KEYSCAN_OUTPUT
+
+        # The config was published to the coordinator.
+        out_provider = state_out.get_relation(provider_relation.id)
+        assert "provider-configuration" in out_provider.local_app_data
+
+    def test_ssh_strict_host_key_checking_disabled(self, context, tmp_path, ssh_key_secret):
+        """strict=false -> host-key checking is turned off and no known_hosts is written."""
+        relation = _ssh_relation(ssh_key_secret, strict=False)
+        state = ops.testing.State(
+            leader=True,
+            containers=[_ssh_synced_container(tmp_path)],
+            relations=[relation, _provider_relation()],
+            secrets=[ssh_key_secret],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        state_out = context.run(context.on.relation_changed(relation), state)
+        assert state_out.unit_status == ops.ActiveStatus()
+
+        out_container = state_out.get_container("git-sync")
+        service = out_container.layers["git-sync"].services["git-sync"]
+        assert "--ssh-known-hosts=false" in service.command
+        assert "--ssh-known-hosts-file" not in service.command
+        container_root = out_container.get_filesystem(context)
+        known_hosts = container_root / charm_module.GIT_SYNC_KNOWN_HOSTS_FILE.lstrip("/")
+        assert not known_hosts.exists()
+
+    def test_ssh_custom_port_folded_into_url(self, context, tmp_path, ssh_key_secret):
+        """A non-default ssh_port is folded into an ssh:// URL and used for keyscan."""
+        relation = _ssh_relation(ssh_key_secret, port=2222)
+        state = ops.testing.State(
+            leader=True,
+            containers=[_ssh_synced_container(tmp_path)],
+            relations=[relation, _provider_relation()],
+            secrets=[ssh_key_secret],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        state_out = context.run(context.on.relation_changed(relation), state)
+        assert state_out.unit_status == ops.ActiveStatus()
+        service = state_out.get_container("git-sync").layers["git-sync"].services["git-sync"]
+        assert "--repo=ssh://git@github.com:2222/example/private.git" in service.command
+
+    def test_ssh_scheme_url_used_unchanged(self, context, tmp_path, ssh_key_secret):
+        """An ssh:// URL carrying its own port is passed through as given."""
+        relation = _ssh_relation(ssh_key_secret, url="ssh://git@github.com:2222/example/x.git")
+        state = ops.testing.State(
+            leader=True,
+            containers=[_ssh_synced_container(tmp_path)],
+            relations=[relation, _provider_relation()],
+            secrets=[ssh_key_secret],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        state_out = context.run(context.on.relation_changed(relation), state)
+        assert state_out.unit_status == ops.ActiveStatus()
+        service = state_out.get_container("git-sync").layers["git-sync"].services["git-sync"]
+        assert "--repo=ssh://git@github.com:2222/example/x.git" in service.command
+
+    def test_ssh_scheme_url_port_override_rewrites_url(self, context, tmp_path, ssh_key_secret):
+        """An ssh_port override replaces the port in an ssh:// URL."""
+        relation = _ssh_relation(
+            ssh_key_secret, url="ssh://git@github.com/example/x.git", port=2222
+        )
+        state = ops.testing.State(
+            leader=True,
+            containers=[_ssh_synced_container(tmp_path)],
+            relations=[relation, _provider_relation()],
+            secrets=[ssh_key_secret],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        state_out = context.run(context.on.relation_changed(relation), state)
+        assert state_out.unit_status == ops.ActiveStatus()
+        service = state_out.get_container("git-sync").layers["git-sync"].services["git-sync"]
+        assert "--repo=ssh://git@github.com:2222/example/x.git" in service.command
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://github.com/example/private.git",
+            "/srv/local/repo.git",
+            "github.com/example/private.git",
+        ],
+    )
+    def test_ssh_blocks_when_url_is_not_an_ssh_url(self, context, tmp_path, ssh_key_secret, url):
+        """SSH auth paired with a non-SSH URL names the misconfiguration.
+
+        The host would otherwise be parsed out of the URL wrongly (``https`` for
+        an https:// one), and the failure would surface as an unreachable host.
+        """
+        relation = _ssh_relation(ssh_key_secret, url=url)
+        state = ops.testing.State(
+            leader=True,
+            containers=[_ssh_synced_container(tmp_path)],
+            relations=[relation, _provider_relation()],
+            secrets=[ssh_key_secret],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        state_out = context.run(context.on.relation_changed(relation), state)
+        assert state_out.unit_status == ops.BlockedStatus(charm_module.INVALID_SSH_URL_MESSAGE)
+
+    def test_ssh_known_hosts_pinned_host_is_not_rescanned(self, context, tmp_path, ssh_key_secret):
+        """An already-pinned host keeps its key, so it cannot be silently swapped.
+
+        _configure_pebble_layer runs on every event, so re-scanning each time
+        would re-trust whatever key the host presents and make strict host key
+        checking worthless.
+        """
+        creds_dir = tmp_path / "git-creds"
+        creds_dir.mkdir()
+        pinned = "github.com ssh-ed25519 AAAApinnedkeydata\n"
+        (creds_dir / "known_hosts").write_text(pinned)
+        relation = _ssh_relation(ssh_key_secret)
+        state = ops.testing.State(
+            leader=True,
+            containers=[_ssh_synced_container(tmp_path, creds_dir=creds_dir)],
+            relations=[relation, _provider_relation()],
+            secrets=[ssh_key_secret],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        state_out = context.run(context.on.relation_changed(relation), state)
+        assert state_out.unit_status == ops.ActiveStatus()
+        # The key the host presents now (KEYSCAN_OUTPUT) did not replace the pin.
+        assert (creds_dir / "known_hosts").read_text() == pinned
+
+    def test_ssh_known_hosts_scanned_when_host_not_pinned(self, context, tmp_path, ssh_key_secret):
+        """Repointing at another host pins that host instead of failing on a stale entry."""
+        creds_dir = tmp_path / "git-creds"
+        creds_dir.mkdir()
+        (creds_dir / "known_hosts").write_text("other.example.com ssh-ed25519 AAAAotherkey\n")
+        relation = _ssh_relation(ssh_key_secret)
+        state = ops.testing.State(
+            leader=True,
+            containers=[_ssh_synced_container(tmp_path, creds_dir=creds_dir)],
+            relations=[relation, _provider_relation()],
+            secrets=[ssh_key_secret],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        state_out = context.run(context.on.relation_changed(relation), state)
+        assert state_out.unit_status == ops.ActiveStatus()
+        assert (creds_dir / "known_hosts").read_text() == KEYSCAN_OUTPUT
+
+    def test_ssh_known_hosts_pin_is_port_specific(self, context, tmp_path, ssh_key_secret):
+        """A bare host pin does not cover the same host reached on another port."""
+        creds_dir = tmp_path / "git-creds"
+        creds_dir.mkdir()
+        (creds_dir / "known_hosts").write_text("github.com ssh-ed25519 AAAApinnedkeydata\n")
+        relation = _ssh_relation(ssh_key_secret, port=2222)
+        state = ops.testing.State(
+            leader=True,
+            containers=[_ssh_synced_container(tmp_path, creds_dir=creds_dir)],
+            relations=[relation, _provider_relation()],
+            secrets=[ssh_key_secret],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        state_out = context.run(context.on.relation_changed(relation), state)
+        assert state_out.unit_status == ops.ActiveStatus()
+        # ssh names a non-default port as "[host]:port", which the bare pin misses.
+        assert (creds_dir / "known_hosts").read_text() == KEYSCAN_OUTPUT
+
+    def test_ssh_blocks_on_passphrase(self, context, tmp_path, ssh_key_secret):
+        """A passphrase-protected key is refused (git-sync cannot unlock it)."""
+        passphrase_secret = ops.testing.Secret({SSH_PASSPHRASE_SECRET_KEY: "s3cret"})
+        relation = _ssh_relation(ssh_key_secret, passphrase_secret=passphrase_secret)
+        state = ops.testing.State(
+            leader=True,
+            containers=[_ssh_synced_container(tmp_path)],
+            relations=[relation, _provider_relation()],
+            secrets=[ssh_key_secret, passphrase_secret],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        state_out = context.run(context.on.relation_changed(relation), state)
+        assert state_out.unit_status == ops.BlockedStatus(
+            charm_module.SSH_PASSPHRASE_NOT_SUPPORTED_MESSAGE
+        )
+
+    def test_ssh_blocks_when_no_private_key(self, context, container):
+        """SSH selected but no private key supplied -> BlockedStatus."""
+        relation = _ssh_relation()  # no key secret
         state = ops.testing.State(
             leader=True,
             containers=[container],
@@ -492,7 +747,66 @@ class TestReconcile:
             config={FILE_PATH_CONFIG: "providers.ini"},
         )
         state_out = context.run(context.on.relation_changed(relation), state)
-        assert isinstance(state_out.unit_status, ops.BlockedStatus)
+        assert state_out.unit_status == ops.BlockedStatus(charm_module.MISSING_SSH_KEY_MESSAGE)
+
+    def test_ssh_blocks_when_known_hosts_scan_fails(self, context, tmp_path, ssh_key_secret):
+        """A failed ssh-keyscan blocks rather than publishing against an unverified host."""
+        relation = _ssh_relation(ssh_key_secret)  # strict defaults on -> scan runs
+        container = _ssh_synced_container(tmp_path, keyscan_stdout="", keyscan_rc=1)
+        state = ops.testing.State(
+            leader=True,
+            containers=[container],
+            relations=[relation, _provider_relation()],
+            secrets=[ssh_key_secret],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        state_out = context.run(context.on.relation_changed(relation), state)
+        assert state_out.unit_status == ops.BlockedStatus(
+            charm_module.KNOWN_HOSTS_SCAN_FAILED_MESSAGE
+        )
+
+    def test_ssh_blocks_when_known_hosts_scan_returns_nothing(
+        self, context, tmp_path, ssh_key_secret
+    ):
+        """ssh-keyscan succeeding with no output must block, not pin an empty file.
+
+        It exits 0 and prints nothing when the host resolves but the port is
+        filtered, so the exit code alone does not tell us the scan worked.
+        """
+        relation = _ssh_relation(ssh_key_secret)
+        container = _ssh_synced_container(tmp_path, keyscan_stdout="", keyscan_rc=0)
+        state = ops.testing.State(
+            leader=True,
+            containers=[container],
+            relations=[relation, _provider_relation()],
+            secrets=[ssh_key_secret],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        state_out = context.run(context.on.relation_changed(relation), state)
+        assert state_out.unit_status == ops.BlockedStatus(
+            charm_module.KNOWN_HOSTS_SCAN_FAILED_MESSAGE
+        )
+
+    def test_ssh_material_removed_when_auth_switches_to_credentials(
+        self, context, tmp_path, pat_secret
+    ):
+        """Switching away from SSH must delete the key, not leave it on disk."""
+        creds_dir = tmp_path / "git-creds"
+        creds_dir.mkdir()
+        (creds_dir / "ssh_key").write_text(SSH_PRIVATE_KEY)
+        (creds_dir / "known_hosts").write_text(KEYSCAN_OUTPUT)
+        relation = _credentials_relation(pat_secret)
+        state = ops.testing.State(
+            leader=True,
+            containers=[_ssh_synced_container(tmp_path, creds_dir=creds_dir)],
+            relations=[relation, _provider_relation()],
+            secrets=[pat_secret],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        state_out = context.run(context.on.relation_changed(relation), state)
+        assert state_out.unit_status == ops.ActiveStatus()
+        assert not (creds_dir / "ssh_key").exists()
+        assert not (creds_dir / "known_hosts").exists()
 
     def test_blocked_on_invalid_git_relation(self, context, container):
         """A git relation present but without usable connection info blocks the unit."""
@@ -582,6 +896,30 @@ class TestReconcile:
         context.run(context.on.update_status(), state)
         assert not password_file.exists()
 
+    def test_ssh_material_removed_when_relation_broken(self, context, tmp_path):
+        """Removing the git relation also deletes any stored SSH key and known_hosts."""
+        creds_dir = tmp_path / "git-creds"
+        creds_dir.mkdir()
+        key_file = creds_dir / "ssh_key"
+        key_file.write_text("stale-key")
+        known_hosts = creds_dir / "known_hosts"
+        known_hosts.write_text("stale-host ssh-ed25519 AAAA")
+        mount_point = charm_module.GIT_SYNC_SSH_KEY_FILE.rsplit("/", 1)[0]
+        seeded = ops.testing.Container(
+            name="git-sync",
+            can_connect=True,
+            mounts={"creds": ops.testing.Mount(location=mount_point, source=creds_dir)},
+        )
+        # No git relation -> prerequisites fail -> SSH material removed.
+        state = ops.testing.State(
+            leader=True,
+            containers=[seeded],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        context.run(context.on.update_status(), state)
+        assert not key_file.exists()
+        assert not known_hosts.exists()
+
 
 class TestSyncNowAction:
     def test_sync_now_publishes(self, context, tmp_path, monkeypatch):
@@ -602,9 +940,7 @@ class TestSyncNowAction:
         out_provider = state_out.get_relation(provider_relation.id)
         assert "provider-configuration" in out_provider.local_app_data
 
-    def test_sync_now_fails_when_service_not_running(
-        self, context, tmp_path, monkeypatch
-    ):
+    def test_sync_now_fails_when_service_not_running(self, context, tmp_path, monkeypatch):
         """sync-now fails cleanly when git-sync is not running to be signalled.
 
         The action reconciles before signalling, which normally configures and
@@ -636,9 +972,7 @@ class TestSyncNowAction:
             context.run(context.on.action("sync-now"), state)
         assert excinfo.value.message == charm_module.SYNC_NOW_NOT_RUNNING_MESSAGE
 
-    def test_sync_now_fails_when_sync_does_not_complete(
-        self, context, tmp_path, monkeypatch
-    ):
+    def test_sync_now_fails_when_sync_does_not_complete(self, context, tmp_path, monkeypatch):
         """sync-now fails if the sync counter never advances within the timeout."""
         repo_dir = tmp_path / "repo"
         repo_dir.mkdir()
@@ -699,9 +1033,7 @@ class TestSyncNowAction:
         with pytest.raises(ops.testing.ActionFailed):
             context.run(context.on.action("sync-now"), state)
 
-    def test_sync_now_configures_git_sync_before_signalling(
-        self, context, tmp_path, monkeypatch
-    ):
+    def test_sync_now_configures_git_sync_before_signalling(self, context, tmp_path, monkeypatch):
         """The action reconciles, so it configures git-sync rather than assuming it.
 
         The action routes through `_reconcile` precisely so it cannot drift from
@@ -748,9 +1080,9 @@ class TestSyncNowAction:
             config={FILE_PATH_CONFIG: "providers.ini"},
         )
         published = context.run(context.on.relation_changed(git_relation), state)
-        assert "provider-configuration" in published.get_relation(
-            provider_relation.id
-        ).local_app_data
+        assert (
+            "provider-configuration" in published.get_relation(provider_relation.id).local_app_data
+        )
 
         without_git = ops.testing.State(
             leader=True,

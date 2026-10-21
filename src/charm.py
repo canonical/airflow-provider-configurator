@@ -26,6 +26,7 @@ import logging
 import re
 import shlex
 import time
+import urllib.parse
 from pathlib import PurePosixPath
 
 import charms.git_integrator.v0.git as git
@@ -48,6 +49,7 @@ from constants import (
     GIT_RELATION_NAME,
     GIT_SYNC_COUNT_METRIC,
     GIT_SYNC_DEST,
+    GIT_SYNC_KNOWN_HOSTS_FILE,
     GIT_SYNC_METRICS_HOST,
     GIT_SYNC_METRICS_PATH,
     GIT_SYNC_METRICS_PORT,
@@ -56,15 +58,19 @@ from constants import (
     GIT_SYNC_ROOT,
     GIT_SYNC_SERVICE,
     GIT_SYNC_SIGNAL,
+    GIT_SYNC_SSH_KEY_FILE,
     INVALID_GIT_RELATION_MESSAGE,
+    INVALID_SSH_URL_MESSAGE,
+    KNOWN_HOSTS_SCAN_FAILED_MESSAGE,
     MALFORMED_CONFIG_FILE_MESSAGE,
     MISSING_FILE_PATH_MESSAGE,
     MISSING_GIT_RELATION_MESSAGE,
     MISSING_SENSITIVE_KEY_MESSAGE,
+    MISSING_SSH_KEY_MESSAGE,
     PEER_CONFIG_HASH_KEY,
     PEER_RELATION_NAME,
     PROVIDER_RELATION_NAME,
-    SSH_NOT_SUPPORTED_MESSAGE,
+    SSH_PASSPHRASE_NOT_SUPPORTED_MESSAGE,
     SYNC_NOW_FETCH_FAILED_MESSAGE,
     SYNC_NOW_NOT_RUNNING_MESSAGE,
     SYNC_NOW_POLL_INTERVAL_SECONDS,
@@ -356,14 +362,23 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         git_info = self._git_connection_info()
         if git_info is None:
             raise ExitWithStatusError(INVALID_GIT_RELATION_MESSAGE, ops.BlockedStatus)
-        if git_info.authentication_method == git.AuthenticationMethodEnum.SSH:
-            raise ExitWithStatusError(SSH_NOT_SUPPORTED_MESSAGE, ops.BlockedStatus)
+        if self._is_ssh(git_info):
+            # git-sync cannot unlock a passphrase-protected key non-interactively,
+            # so refuse it here rather than let the fetch fail opaquely later.
+            passphrase = git_info.ssh_passphrase
+            if passphrase and passphrase != "None":
+                raise ExitWithStatusError(SSH_PASSPHRASE_NOT_SUPPORTED_MESSAGE, ops.BlockedStatus)
+            if not git_info.ssh_private_key or git_info.ssh_private_key == "None":
+                raise ExitWithStatusError(MISSING_SSH_KEY_MESSAGE, ops.BlockedStatus)
+            if not self._is_ssh_url(git_info.repository_url):
+                raise ExitWithStatusError(INVALID_SSH_URL_MESSAGE, ops.BlockedStatus)
         if not self._container.can_connect():
             raise ExitWithStatusError(WAITING_FOR_CONTAINER_MESSAGE, ops.WaitingStatus)
 
     def _configure_pebble_layer(self) -> None:
         """Push git credentials and the exechook, then (re)configure git-sync."""
         self._push_git_credentials()
+        self._push_ssh_credentials()
         try:
             self._container.push(
                 EXECHOOK_SCRIPT_PATH,
@@ -403,6 +418,8 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         if GIT_SYNC_SERVICE in self._container.get_services():
             self._container.stop(GIT_SYNC_SERVICE)
         self._container.remove_path(GIT_SYNC_PASSWORD_FILE, recursive=True)
+        self._container.remove_path(GIT_SYNC_SSH_KEY_FILE, recursive=True)
+        self._container.remove_path(GIT_SYNC_KNOWN_HOSTS_FILE, recursive=True)
 
     def _publish_configuration(self, *, force: bool = False) -> None:
         """Read the synced .ini and publish it over the relation.
@@ -632,6 +649,183 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
                 ops.BlockedStatus,
             ) from e
 
+    @staticmethod
+    def _is_ssh(git_info: git.GitProviderModel | None) -> bool:
+        """Whether the git relation selected SSH authentication."""
+        return (
+            git_info is not None
+            and git_info.authentication_method == git.AuthenticationMethodEnum.SSH
+        )
+
+    @staticmethod
+    def _is_ssh_url(url: str) -> bool:
+        """Whether ``url`` is an SSH clone URL that _ssh_url_parts can parse.
+
+        The git relation lets SSH authentication be paired with any URL, so an
+        https:// one can arrive here. Its host would then be parsed as the
+        scheme, which _ssh_url_parts has no way to detect, so the shape is
+        checked before it is relied on. The rule follows git's own: a URL with a
+        scheme must use ssh, otherwise it must be scp-style ``[user@]host:path``,
+        which is only recognised when no slash precedes the first colon.
+        """
+        scheme, separator, _ = url.partition("://")
+        if separator:
+            return scheme == "ssh"
+        userhost, separator, _ = url.partition(":")
+        return bool(separator) and "/" not in userhost
+
+    @classmethod
+    def _ssh_url_parts(cls, git_info: git.GitProviderModel) -> tuple[str, str, int]:
+        """Return ``(repo_url, host, port)`` for an SSH relation.
+
+        git-sync infers SSH from the URL and has no port flag, so a non-default
+        ``ssh_port`` from the relation is folded into an
+        ``ssh://user@host:port/path`` URL; without one the relation's URL is used
+        unchanged. The returned host and port are also what ``ssh-keyscan`` is run
+        against to build known_hosts.
+
+        Only call this for a URL _is_ssh_url accepts.
+        """
+        url = git_info.repository_url
+        override = git_info.ssh_port
+        if url.startswith("ssh://"):
+            parsed = urllib.parse.urlsplit(url)
+            host = parsed.hostname or ""
+            port = override or parsed.port or 22
+            if override and override != parsed.port:
+                userinfo = f"{parsed.username}@" if parsed.username else ""
+                url = f"ssh://{userinfo}{cls._url_host(host)}:{port}{parsed.path}"
+            return url, host, port
+        # scp-style: ``[user@]host:path``.
+        userhost, _, path = url.partition(":")
+        user, _, host = userhost.rpartition("@")
+        host = host or userhost
+        port = override or 22
+        if override:
+            userinfo = f"{user}@" if user else ""
+            url = f"ssh://{userinfo}{cls._url_host(host)}:{port}/{path}"
+        return url, host, port
+
+    @staticmethod
+    def _url_host(host: str) -> str:
+        """Host as it appears in a URL: IPv6 literals need brackets, others not.
+
+        ``urlsplit().hostname`` strips the brackets, so they have to be put back
+        when a URL is rebuilt or the address' own colons are read as the port.
+        """
+        return f"[{host}]" if ":" in host else host
+
+    def _push_ssh_credentials(self) -> None:
+        """Write the SSH private key and known_hosts read by git-sync.
+
+        The private key is stored in a root-only file inside the container and
+        referenced via ``--ssh-key-file`` (see _git_sync_command), mirroring how
+        the PAT is handled so it stays off the command line. When strict host key
+        checking is on (the default), the host's key is pinned in a known_hosts
+        file the first time it is seen (see _write_known_hosts) so git-sync can
+        verify it.
+
+        When the relation is not using SSH, any previously written SSH material is
+        removed so a stale key does not linger once auth changes or the relation
+        goes away.
+        """
+        git_info = self._git_connection_info()
+        if not self._is_ssh(git_info):
+            self._container.remove_path(GIT_SYNC_SSH_KEY_FILE, recursive=True)
+            self._container.remove_path(GIT_SYNC_KNOWN_HOSTS_FILE, recursive=True)
+            return
+
+        # _validate_prerequisites has already rejected a missing key / passphrase.
+        key = git_info.ssh_private_key
+        try:
+            # SSH keys must end with exactly one newline or ssh rejects them.
+            self._container.push(
+                GIT_SYNC_SSH_KEY_FILE,
+                key.rstrip("\n") + "\n",
+                make_dirs=True,
+                permissions=0o400,
+            )
+        except ops.pebble.PathError as e:
+            raise ExitWithStatusError(
+                "Failed to write the SSH key to the workload container.",
+                ops.BlockedStatus,
+            ) from e
+
+        if git_info.ssh_strict_host_key_checking is False:
+            # Verification disabled: no known_hosts needed, and a stale one would
+            # be ignored, so drop it.
+            self._container.remove_path(GIT_SYNC_KNOWN_HOSTS_FILE, recursive=True)
+            return
+        self._write_known_hosts(git_info)
+
+    @staticmethod
+    def _known_hosts_marker(host: str, port: int) -> str:
+        """How ssh names a host in known_hosts: bare, or ``[host]:port`` off 22."""
+        return host if port == 22 else f"[{host}]:{port}"
+
+    def _is_host_pinned(self, host: str, port: int) -> bool:
+        """Whether known_hosts already holds a key for this host:port."""
+        try:
+            with self._container.pull(GIT_SYNC_KNOWN_HOSTS_FILE) as f:
+                content = f.read()
+        except (ops.pebble.PathError, ops.pebble.APIError):
+            return False
+        marker = self._known_hosts_marker(host, port)
+        for line in content.splitlines():
+            fields = line.strip().split()
+            # Each entry is "<host-patterns> <key-type> <key>", and the first
+            # field may be a comma-separated list of patterns.
+            if fields and not fields[0].startswith(("#", "@")) and marker in fields[0].split(","):
+                return True
+        return False
+
+    def _write_known_hosts(self, git_info: git.GitProviderModel) -> None:
+        """Pin the git host's SSH key in known_hosts, on first sight only.
+
+        This is trust-on-first-use: the key is fetched with ``ssh-keyscan``
+        rather than verified against a pre-shared value, because the git relation
+        advertises no known_hosts. Once a host is pinned it is never re-scanned,
+        so a subsequent key change makes git-sync fail loudly instead of being
+        silently re-trusted -- re-scanning on every hook would hand an attacker
+        the trust decision afresh each time and make strict host key checking
+        worthless. It also keeps a network round trip out of every hook.
+
+        A different host or port is scanned and pinned in turn, so repointing the
+        relation at another repository still works. To re-pin after a legitimate
+        host key rotation, turn ``ssh_strict_host_key_checking`` off and on again
+        on the git integrator: that discards the stored file (see
+        _push_ssh_credentials) and the next hook scans afresh.
+
+        Two limits are worth knowing. The pin lives in the container's filesystem,
+        which is not backed by storage, so a pod restart re-opens the first-use
+        window. And the re-pin procedure above syncs without verification while
+        it is turned off. Both are inherent to a relation that carries no
+        known_hosts of its own; pinning still removes the far larger exposure of
+        re-deciding trust on every hook.
+
+        A failed or empty scan blocks the unit with a clear message rather than
+        publishing against an unverifiable host.
+        """
+        _, host, port = self._ssh_url_parts(git_info)
+        if self._is_host_pinned(host, port):
+            return
+        try:
+            process = self._container.exec(["ssh-keyscan", "-p", str(port), host])
+            stdout, _ = process.wait_output()
+        except (ops.pebble.ExecError, ops.pebble.ChangeError, ops.pebble.APIError) as e:
+            raise ExitWithStatusError(KNOWN_HOSTS_SCAN_FAILED_MESSAGE, ops.BlockedStatus) from e
+        if not stdout.strip():
+            raise ExitWithStatusError(KNOWN_HOSTS_SCAN_FAILED_MESSAGE, ops.BlockedStatus)
+        try:
+            self._container.push(
+                GIT_SYNC_KNOWN_HOSTS_FILE, stdout, make_dirs=True, permissions=0o644
+            )
+        except ops.pebble.PathError as e:
+            raise ExitWithStatusError(
+                "Failed to write known_hosts to the workload container.",
+                ops.BlockedStatus,
+            ) from e
+
     def _exechook_script(self) -> str:
         """The script git-sync runs after each changed sync; fires a Pebble notice."""
         return (
@@ -678,9 +872,12 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         at `--http-bind` lets the action detect that the sync it asked for has
         finished (see _git_sync_counts for why `--touch-file` is unsuitable).
         """
+        repo_url = git_info.repository_url
+        if self._is_ssh(git_info):
+            repo_url = self._ssh_url_parts(git_info)[0]
         parts = [
             "/bin/git-sync",
-            f"--repo={git_info.repository_url}",
+            f"--repo={repo_url}",
             f"--root={GIT_SYNC_ROOT}",
             f"--link={GIT_SYNC_DEST}",
             f"--period={self._sync_period}",
@@ -691,9 +888,20 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         ]
         if git_info.tracking_ref:
             parts.append(f"--ref={git_info.tracking_ref}")
-        credentials = self._https_credentials(git_info)
-        if credentials is not None:
-            parts.append(f"--username={credentials[0]}")
+        if self._is_ssh(git_info):
+            # git-sync infers SSH from the URL; it needs the key file, plus
+            # --add-user so ssh can resolve the running UID even if the image
+            # ever stops running the workload as a user present in /etc/passwd.
+            parts.append(f"--ssh-key-file={GIT_SYNC_SSH_KEY_FILE}")
+            parts.append("--add-user")
+            if git_info.ssh_strict_host_key_checking is False:
+                parts.append("--ssh-known-hosts=false")
+            else:
+                parts.append(f"--ssh-known-hosts-file={GIT_SYNC_KNOWN_HOSTS_FILE}")
+        else:
+            credentials = self._https_credentials(git_info)
+            if credentials is not None:
+                parts.append(f"--username={credentials[0]}")
         return shlex.join(parts)
 
     def _git_sync_environment(self, git_info: git.GitProviderModel) -> dict[str, str]:
