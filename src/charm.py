@@ -59,6 +59,7 @@ from constants import (
     GIT_SYNC_SERVICE,
     GIT_SYNC_SIGNAL,
     GIT_SYNC_SSH_KEY_FILE,
+    GIT_SYNC_START_FAILED_MESSAGE,
     INVALID_GIT_RELATION_MESSAGE,
     INVALID_SSH_URL_MESSAGE,
     KNOWN_HOSTS_SCAN_FAILED_MESSAGE,
@@ -271,7 +272,7 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
             was also set as the unit status.
         """
         try:
-            self._validate_prerequisites()
+            git_info = self._validate_prerequisites()
         except ExitWithStatusError as e:
             # Prerequisites not met (e.g. git relation removed): stop git-sync so
             # it doesn't keep polling a stale/unrelated repo, then report status.
@@ -290,7 +291,7 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
             # Ordered before the forced sync so the fetch uses the current layer
             # (repo, ref, credentials) rather than whatever git-sync was last
             # started with.
-            self._configure_pebble_layer()
+            self._configure_pebble_layer(git_info)
             if force_sync:
                 self._trigger_sync()
             self._publish_configuration(force=force_publish or force_sync)
@@ -349,8 +350,14 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         self._config_provider.clear_configuration()
         self._clear_stored_config_hash()
 
-    def _validate_prerequisites(self) -> None:
+    def _validate_prerequisites(self) -> git.GitProviderModel:
         """Check required config, the git relation, and the container are ready.
+
+        Returns:
+            The validated git connection info, so the rest of the reconcile can
+            thread it through instead of reading the relation again. Everything
+            downstream needs the same snapshot, and re-reading it would also let
+            the authentication method appear to change midway through a hook.
 
         Raises:
             ExitWithStatusError: if any prerequisite is not met.
@@ -374,11 +381,12 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
                 raise ExitWithStatusError(INVALID_SSH_URL_MESSAGE, ops.BlockedStatus)
         if not self._container.can_connect():
             raise ExitWithStatusError(WAITING_FOR_CONTAINER_MESSAGE, ops.WaitingStatus)
+        return git_info
 
-    def _configure_pebble_layer(self) -> None:
+    def _configure_pebble_layer(self, git_info: git.GitProviderModel) -> None:
         """Push git credentials and the exechook, then (re)configure git-sync."""
-        self._push_git_credentials()
-        self._push_ssh_credentials()
+        self._push_git_credentials(git_info)
+        self._push_ssh_credentials(git_info)
         try:
             self._container.push(
                 EXECHOOK_SCRIPT_PATH,
@@ -399,10 +407,18 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         # comparison uses Pebble's own normalized view rather than a hand-rolled
         # diff of a raw layer against a combined plan.
         services_before = self._container.get_plan().services
-        self._container.add_layer(GIT_SYNC_SERVICE, self._git_sync_layer, combine=True)
+        self._container.add_layer(GIT_SYNC_SERVICE, self._git_sync_layer(git_info), combine=True)
         services_after = self._container.get_plan().services
         if services_before != services_after:
-            self._container.replan()
+            try:
+                self._container.replan()
+            except ops.pebble.ChangeError as e:
+                # git-sync runs with --max-failures=0, so it exits on its first
+                # failed fetch and Pebble reports the start as failed. Rejected
+                # credentials are the usual trigger, which is an operator-fixable
+                # misconfiguration rather than a charm bug, so report it as a
+                # status instead of letting the hook error out.
+                raise ExitWithStatusError(GIT_SYNC_START_FAILED_MESSAGE, ops.BlockedStatus) from e
 
     def _stop_git_sync(self) -> None:
         """Stop the git-sync service so it doesn't keep polling a stale/unrelated repo.
@@ -625,7 +641,7 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
             return None
         return username, token
 
-    def _push_git_credentials(self) -> None:
+    def _push_git_credentials(self, git_info: git.GitProviderModel) -> None:
         """Write the git PAT to a private file read by git-sync.
 
         The token is stored in a root-only file inside the container and passed to
@@ -636,7 +652,7 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         credentials or switched to SSH) any previously written credentials file is
         removed so a stale secret does not linger in the container.
         """
-        credentials = self._https_credentials(self._git_connection_info())
+        credentials = self._https_credentials(git_info)
         if credentials is None:
             self._container.remove_path(GIT_SYNC_PASSWORD_FILE, recursive=True)
             return
@@ -715,26 +731,37 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         """
         return f"[{host}]" if ":" in host else host
 
-    def _push_ssh_credentials(self) -> None:
-        """Write the SSH private key and known_hosts read by git-sync.
+    def _push_ssh_credentials(self, git_info: git.GitProviderModel) -> None:
+        """Make the container's SSH material match the relation.
 
-        The private key is stored in a root-only file inside the container and
-        referenced via ``--ssh-key-file`` (see _git_sync_command), mirroring how
-        the PAT is handled so it stays off the command line. When strict host key
-        checking is on (the default), the host's key is pinned in a known_hosts
-        file the first time it is seen (see _write_known_hosts) so git-sync can
-        verify it.
+        Splits into the two concerns it coordinates: the private key that
+        authenticates this client (_push_ssh_key), and the known_hosts file that
+        verifies the remote (_configure_known_hosts).
 
         When the relation is not using SSH, any previously written SSH material is
         removed so a stale key does not linger once auth changes or the relation
         goes away.
         """
-        git_info = self._git_connection_info()
         if not self._is_ssh(git_info):
             self._container.remove_path(GIT_SYNC_SSH_KEY_FILE, recursive=True)
             self._container.remove_path(GIT_SYNC_KNOWN_HOSTS_FILE, recursive=True)
             return
+        self._push_ssh_key(git_info)
+        self._configure_known_hosts(git_info)
 
+    def _push_ssh_key(self, git_info: git.GitProviderModel) -> None:
+        """Write the private key git-sync authenticates with.
+
+        Stored in a root-only file inside the container and referenced via
+        ``--ssh-key-file`` (see _git_sync_command), mirroring how the PAT is
+        handled so it stays off the command line.
+
+        Rewriting this file is all a key rotation needs: git-sync runs each fetch
+        as a fresh ``ssh`` process that re-reads the key from disk, so a rotated
+        key takes effect on the next sync without restarting the service (and a
+        key that stops working makes git-sync exit, after which Pebble restarts
+        it and it re-reads the file anyway).
+        """
         # _validate_prerequisites has already rejected a missing key / passphrase.
         key = git_info.ssh_private_key
         try:
@@ -751,9 +778,15 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
                 ops.BlockedStatus,
             ) from e
 
+    def _configure_known_hosts(self, git_info: git.GitProviderModel) -> None:
+        """Make known_hosts match the relation's host verification setting.
+
+        With strict host key checking on (the default) the host's key is pinned
+        the first time it is seen (see _write_known_hosts) so git-sync can verify
+        it. With it off, the file is removed: git-sync is told to ignore it (see
+        _git_sync_command), and leaving a stale pin behind would be misleading.
+        """
         if git_info.ssh_strict_host_key_checking is False:
-            # Verification disabled: no known_hosts needed, and a stale one would
-            # be ignored, so drop it.
             self._container.remove_path(GIT_SYNC_KNOWN_HOSTS_FILE, recursive=True)
             return
         self._write_known_hosts(git_info)
@@ -794,7 +827,7 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         relation at another repository still works. To re-pin after a legitimate
         host key rotation, turn ``ssh_strict_host_key_checking`` off and on again
         on the git integrator: that discards the stored file (see
-        _push_ssh_credentials) and the next hook scans afresh.
+        _configure_known_hosts) and the next hook scans afresh.
 
         Two limits are worth knowing. The pin lives in the container's filesystem,
         which is not backed by storage, so a pod restart re-opens the first-use
@@ -834,12 +867,8 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
             f"exec pebble notify {CONTENT_SYNCED_NOTICE_KEY}\n"
         )
 
-    @property
-    def _git_sync_layer(self) -> ops.pebble.Layer:
+    def _git_sync_layer(self, git_info: git.GitProviderModel) -> ops.pebble.Layer:
         """Build the Pebble layer that runs git-sync in continuous poll mode."""
-        git_info = self._git_connection_info()
-        if git_info is None:
-            raise ExitWithStatusError(INVALID_GIT_RELATION_MESSAGE, ops.BlockedStatus)
         service: ops.pebble.ServiceDict = {
             "override": "replace",
             "summary": "git-sync",

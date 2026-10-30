@@ -6,6 +6,7 @@
 import hashlib
 import json
 import shlex
+import stat
 
 import charms.git_integrator.v0.git as git
 import ops
@@ -808,6 +809,38 @@ class TestReconcile:
         assert not (creds_dir / "ssh_key").exists()
         assert not (creds_dir / "known_hosts").exists()
 
+    def test_ssh_key_rotation_rewrites_the_key_file(self, context, tmp_path, ssh_key_secret):
+        """A rotated key overwrites the file git-sync reads from.
+
+        Rotation changes no part of the Pebble service definition, so nothing
+        replans or restarts. That is sufficient: git-sync runs every fetch as a
+        fresh ``ssh`` process that re-reads ``--ssh-key-file`` from disk, so
+        overwriting the file is what makes the new key take effect. Verified
+        against git-sync 4.7.0 by swapping the file under a running process and
+        watching the very next fetch fail to authenticate.
+        """
+        creds_dir = tmp_path / "git-creds"
+        creds_dir.mkdir()
+        (creds_dir / "ssh_key").write_text("-----BEGIN OPENSSH PRIVATE KEY-----\nsuperseded\n")
+        # Pre-pin the host so the key is the only thing that changes.
+        (creds_dir / "known_hosts").write_text(KEYSCAN_OUTPUT)
+        relation = _ssh_relation(ssh_key_secret)
+        state = ops.testing.State(
+            leader=True,
+            containers=[_ssh_synced_container(tmp_path, creds_dir=creds_dir)],
+            relations=[relation, _provider_relation()],
+            secrets=[ssh_key_secret],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+
+        state_out = context.run(context.on.secret_changed(ssh_key_secret), state)
+
+        assert state_out.unit_status == ops.ActiveStatus()
+        assert (creds_dir / "ssh_key").read_text() == SSH_PRIVATE_KEY + "\n"
+        assert stat.S_IMODE((creds_dir / "ssh_key").stat().st_mode) == 0o400
+        service = state_out.get_container("git-sync").layers["git-sync"].services["git-sync"]
+        assert f"--ssh-key-file={charm_module.GIT_SYNC_SSH_KEY_FILE}" in service.command
+
     def test_blocked_on_invalid_git_relation(self, context, container):
         """A git relation present but without usable connection info blocks the unit."""
         relation = ops.testing.Relation(GIT_RELATION, interface="git", remote_app_data={})
@@ -842,6 +875,35 @@ class TestReconcile:
         state_out = context.run(context.on.relation_changed(relation), state)
         assert state_out.unit_status == ops.BlockedStatus(
             "Failed to write git credentials to the workload container."
+        )
+
+    def test_blocked_when_git_sync_fails_to_start(
+        self, context, container, pat_secret, monkeypatch
+    ):
+        """A git-sync that exits on startup blocks the unit rather than erroring the hook.
+
+        git-sync runs with --max-failures=0, so credentials the remote rejects
+        make it exit on its first fetch and Pebble reports the start as failed.
+        That is an operator-fixable misconfiguration, so it must surface as a
+        status with a usable message instead of 'hook failed: config-changed'.
+        Observed against a live deployment with an unregistered SSH key.
+        """
+        relation = _credentials_relation(pat_secret)
+        state = ops.testing.State(
+            leader=True,
+            containers=[container],
+            relations=[relation, _provider_relation()],
+            secrets=[pat_secret],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+
+        def _raise_change_error(*args, **kwargs):
+            raise ops.pebble.ChangeError("exited quickly with code 1", change=None)
+
+        monkeypatch.setattr(ops.Container, "replan", _raise_change_error)
+        state_out = context.run(context.on.relation_changed(relation), state)
+        assert state_out.unit_status == ops.BlockedStatus(
+            charm_module.GIT_SYNC_START_FAILED_MESSAGE
         )
 
     def test_git_sync_stopped_when_relation_broken(self, context):
@@ -955,7 +1017,7 @@ class TestSyncNowAction:
         monkeypatch.setattr(
             charm_module.AirflowProviderConfiguratorCharm,
             "_configure_pebble_layer",
-            lambda _self: None,
+            lambda _self, _git_info: None,
         )
         not_running = ops.testing.Container(
             name="git-sync",

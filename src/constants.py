@@ -98,11 +98,23 @@ INVALID_SSH_URL_MESSAGE = (
 )
 # ssh-keyscan could not retrieve the host key needed for strict host-key
 # verification (host unreachable, wrong port, or ssh-keyscan unavailable).
+# Deliberately does not offer turning strict host key checking off as a remedy:
+# that disables verification altogether and invites an operator to reach for it
+# as a routine fix for what is normally a connectivity problem.
 KNOWN_HOSTS_SCAN_FAILED_MESSAGE = (
     "Could not retrieve the git host's SSH key for host verification; check the "
-    "repository host and port, or disable strict host key checking on the git relation"
+    "repository host and port are reachable from the unit"
 )
 WAITING_FOR_CONTAINER_MESSAGE = "Waiting for the git-sync container"
+# git-sync exited immediately after being (re)started. It runs with
+# --max-failures=0, so any failed fetch terminates it, and the most common
+# cause by far is a credential the remote rejects (an unregistered or revoked
+# SSH key, an expired token). That is an operator-fixable condition, so it is
+# reported as blocked rather than being allowed to surface as a hook error.
+GIT_SYNC_START_FAILED_MESSAGE = (
+    "git-sync failed to start; check the repository URL and that the supplied "
+    "credentials are accepted by the remote"
+)
 MISSING_SENSITIVE_KEY_MESSAGE = (
     "Sensitive configuration secret is missing the 'airflow-provider-configurations' key"
 )
