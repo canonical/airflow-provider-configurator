@@ -24,8 +24,10 @@ all written before the service is started, so they remain inspectable.
 
 import logging
 import subprocess
+import time
 
 import jubilant
+import pytest
 from conftest import (
     APP_NAME,
     GIT_INTEGRATOR_APP,
@@ -55,7 +57,6 @@ INVALID_SSH_URL_MESSAGE = (
     "Git relation selected SSH authentication but the repository URL is not an SSH URL; "
     "use ssh://user@host/path or user@host:path"
 )
-MISSING_SSH_KEY_MESSAGE = "Git relation selected SSH authentication but provided no private key"
 GIT_SYNC_START_FAILED_MESSAGE = (
     "git-sync failed to start; check the repository URL and that the supplied "
     "credentials are accepted by the remote"
@@ -108,6 +109,9 @@ def _configure_ssh(juju: jubilant.Juju, **overrides) -> None:
         "repository_url": SSH_REPO_URL,
         # git-integrator raises KeyError if this is ever left unset.
         "ssh_strict_host_key_checking": True,
+        # Explicit, so a test that overrides the port cannot leak it into the
+        # next one: leaving it unset keeps the previous value.
+        "ssh_port": 22,
     }
     config.update(overrides)
     juju.config(GIT_INTEGRATOR_APP, config)
@@ -260,29 +264,50 @@ def test_custom_ssh_port_is_folded_into_the_url_and_the_pin(juju: jubilant.Juju)
     _wait_for_rejected_key(juju)
 
 
+# This test must stay LAST. The upstream bug it trips leaves git-integrator in
+# an error state that stops it applying any further config, so every test that
+# ran after it would fail for reasons unrelated to what it checks.
+#
+# There is deliberately no integration test for "SSH selected but no key": the
+# real provider blocks itself and publishes nothing in that case, so the charm
+# never observes it. test_charm.py covers that message directly.
+@pytest.mark.xfail(
+    strict=False,
+    reason=(
+        "git-integrator (1.0/edge rev 5) never propagates a rotated key: its "
+        "GitProviderEventHandler does not override _on_secret_changed_event, so the "
+        "abstract base raises NotImplementedError and the secret-changed hook fails. "
+        "This charm rewrites the key file correctly once it is published."
+    ),
+)
 def test_key_rotation_rewrites_the_file_without_a_restart(juju: jubilant.Juju, tmp_path):
     """A rotated key reaches the container, and git-sync keeps using the file.
 
     Rotation changes nothing in the Pebble layer, so this also confirms the
     charm does not need to restart git-sync for a new key to take effect.
+
+    The secret is updated in place, which is how an operator rotates a key.
+    Pointing git-integrator at a different secret is not equivalent: it fails
+    separately upstream (the fixed 'ssh-private-key' secret label is already
+    taken by the first secret).
     """
     before = _workload(juju, f"sha256sum {SSH_KEY_FILE}").split()[0]
 
-    rotated_path = tmp_path / "rotated_ed25519"
+    rotated = tmp_path / "rotated_ed25519"
     subprocess.run(
-        ["ssh-keygen", "-t", "ed25519", "-N", "", "-C", "rotated", "-f", str(rotated_path)],
+        ["ssh-keygen", "-t", "ed25519", "-N", "", "-C", "rotated", "-f", str(rotated)],
         check=True,
         capture_output=True,
     )
-    juju.update_secret("apc-ssh-key", {"ssh-private-key": rotated_path.read_text()})
-    _wait_for_rejected_key(juju)
+    juju.update_secret("apc-ssh-key", {"ssh-private-key": rotated.read_text()})
 
-    after = _workload(juju, f"sha256sum {SSH_KEY_FILE}").split()[0]
+    # Poll: waiting on status alone returns at once, because the charm is
+    # already in its steady state before the rotation has had any effect.
+    deadline = time.monotonic() + 120
+    after = before
+    while time.monotonic() < deadline and after == before:
+        time.sleep(5)
+        after = _workload(juju, f"sha256sum {SSH_KEY_FILE}").split()[0]
+
     assert after != before, "the rotated key never reached the workload container"
     assert _workload(juju, f"stat -c '%a' {SSH_KEY_FILE}").strip() == "400"
-
-
-def test_blocks_when_ssh_selected_without_a_key(juju: jubilant.Juju):
-    """SSH auth with no key must block with a clear message."""
-    juju.cli("config", GIT_INTEGRATOR_APP, "--reset", "ssh_private_key_secret")
-    juju.wait(lambda status: _blocked_with(status, MISSING_SSH_KEY_MESSAGE))
