@@ -21,6 +21,13 @@ GIT_SYNC_DEST = "repo"
 # Private, root-only file holding the git PAT so it never appears on the command
 # line or in the service environment.
 GIT_SYNC_PASSWORD_FILE = "/git-creds/password"
+# Private, root-only file holding the SSH private key, pointed at by git-sync's
+# --ssh-key-file. Like the PAT file it is kept off the command line and out of
+# the service environment.
+GIT_SYNC_SSH_KEY_FILE = "/git-creds/ssh_key"
+# known_hosts file for SSH host-key verification, populated by ssh-keyscan when
+# strict host key checking is on and pointed at via --ssh-known-hosts-file.
+GIT_SYNC_KNOWN_HOSTS_FILE = "/git-creds/known_hosts"
 # Script git-sync runs (via --exechook-command) after each changed sync.
 EXECHOOK_SCRIPT_PATH = "/usr/local/bin/notify-content-synced"
 # Pebble custom-notice key fired by the exechook when content changes.
@@ -73,11 +80,43 @@ MISSING_GIT_RELATION_MESSAGE = (
     "Missing git relation; relate to a git provider (e.g. git-integrator)"
 )
 INVALID_GIT_RELATION_MESSAGE = "Git relation has not provided valid repository information"
-SSH_NOT_SUPPORTED_MESSAGE = "SSH authentication is not supported yet; use HTTPS or a public repo"
+# SSH auth. git-sync cannot unlock a passphrase-protected key non-interactively
+# (unlike the coordinator's Airflow git connection, which can), so such keys are
+# refused up front rather than failing opaquely at fetch time.
+SSH_PASSPHRASE_NOT_SUPPORTED_MESSAGE = (
+    "Passphrase-protected SSH keys are not supported; provide a key without a passphrase"
+)
+# The git relation selected SSH authentication but supplied no private key.
+MISSING_SSH_KEY_MESSAGE = "Git relation selected SSH authentication but provided no private key"
+# The git relation selected SSH authentication but gave a URL that is not an
+# SSH one (e.g. an https:// clone URL). Caught up front because the host would
+# otherwise be parsed out of the URL wrongly and reported as an unreachable
+# host rather than as the misconfiguration it is.
+INVALID_SSH_URL_MESSAGE = (
+    "Git relation selected SSH authentication but the repository URL is not an SSH URL; "
+    "use ssh://user@host/path or user@host:path"
+)
+# ssh-keyscan could not retrieve the host key needed for strict host-key
+# verification (host unreachable, wrong port, or ssh-keyscan unavailable).
+# Deliberately does not offer turning strict host key checking off as a remedy:
+# that disables verification altogether and invites an operator to reach for it
+# as a routine fix for what is normally a connectivity problem.
+KNOWN_HOSTS_SCAN_FAILED_MESSAGE = (
+    "Could not retrieve the git host's SSH key for host verification; check the "
+    "repository host and port are reachable from the unit"
+)
 WAITING_FOR_CONTAINER_MESSAGE = "Waiting for the git-sync container"
+# git-sync exited immediately after being (re)started. It runs with
+# --max-failures=0, so any failed fetch terminates it, and the most common
+# cause by far is a credential the remote rejects (an unregistered or revoked
+# SSH key, an expired token). That is an operator-fixable condition, so it is
+# reported as blocked rather than being allowed to surface as a hook error.
+GIT_SYNC_START_FAILED_MESSAGE = (
+    "git-sync failed to start; check the repository URL and that the supplied "
+    "credentials are accepted by the remote"
+)
 MISSING_SENSITIVE_KEY_MESSAGE = (
-    "Sensitive configuration secret is missing the "
-    "'airflow-provider-configurations' key"
+    "Sensitive configuration secret is missing the 'airflow-provider-configurations' key"
 )
 SYNC_NOW_NOT_RUNNING_MESSAGE = "git-sync is not running; cannot force a sync"
 SYNC_NOW_TIMEOUT_MESSAGE = "Forced git-sync did not complete in time"
