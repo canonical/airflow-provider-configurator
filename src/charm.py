@@ -61,6 +61,7 @@ from constants import (
     GIT_SYNC_SSH_KEY_FILE,
     GIT_SYNC_START_FAILED_MESSAGE,
     INVALID_GIT_RELATION_MESSAGE,
+    INVALID_SSH_PORT_MESSAGE,
     INVALID_SSH_URL_MESSAGE,
     KNOWN_HOSTS_SCAN_FAILED_MESSAGE,
     MALFORMED_CONFIG_FILE_MESSAGE,
@@ -379,6 +380,8 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
                 raise ExitWithStatusError(MISSING_SSH_KEY_MESSAGE, ops.BlockedStatus)
             if not self._is_ssh_url(git_info.repository_url):
                 raise ExitWithStatusError(INVALID_SSH_URL_MESSAGE, ops.BlockedStatus)
+            if git_info.ssh_port is not None and not self._is_valid_port(git_info.ssh_port):
+                raise ExitWithStatusError(INVALID_SSH_PORT_MESSAGE, ops.BlockedStatus)
         if not self._container.can_connect():
             raise ExitWithStatusError(WAITING_FOR_CONTAINER_MESSAGE, ops.WaitingStatus)
         return git_info
@@ -674,21 +677,48 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         )
 
     @staticmethod
-    def _is_ssh_url(url: str) -> bool:
-        """Whether ``url`` is an SSH clone URL that _ssh_url_parts can parse.
+    def _is_valid_port(port: int) -> bool:
+        """Whether ``port`` is a usable TCP port."""
+        return 1 <= port <= 65535
+
+    @classmethod
+    def _is_ssh_url(cls, url: str) -> bool:
+        """Whether ``url`` is a well-formed SSH clone URL that _ssh_url_parts can parse.
 
         The git relation lets SSH authentication be paired with any URL, so an
-        https:// one can arrive here. Its host would then be parsed as the
-        scheme, which _ssh_url_parts has no way to detect, so the shape is
-        checked before it is relied on. The rule follows git's own: a URL with a
-        scheme must use ssh, otherwise it must be scp-style ``[user@]host:path``,
+        https:// one can arrive here, as can a malformed SSH one. Both would
+        otherwise surface as an unreachable host or, worse, as an exception out of
+        _ssh_url_parts (e.g. ``urlsplit().port`` raising ValueError) and so a hook
+        error rather than a Blocked status. The rule follows git's own: a URL with
+        a scheme must use ssh, otherwise it must be scp-style ``[user@]host:path``,
         which is only recognised when no slash precedes the first colon.
+
+        Either form must also name a host and a repository path, any port in the
+        URL must be valid, and the host must not start with ``-`` so it can never
+        be read as an option by ``ssh-keyscan``.
         """
         scheme, separator, _ = url.partition("://")
         if separator:
-            return scheme == "ssh"
-        userhost, separator, _ = url.partition(":")
-        return bool(separator) and "/" not in userhost
+            if scheme != "ssh":
+                return False
+            try:
+                parsed = urllib.parse.urlsplit(url)
+                port = parsed.port
+            except ValueError:
+                return False
+            host = parsed.hostname or ""
+            path = parsed.path.strip("/")
+            return (
+                bool(host)
+                and not host.startswith("-")
+                and bool(path)
+                and (port is None or cls._is_valid_port(port))
+            )
+        userhost, separator, path = url.partition(":")
+        if not separator or "/" in userhost:
+            return False
+        host = userhost.rpartition("@")[2]
+        return bool(host) and not host.startswith("-") and bool(path)
 
     @classmethod
     def _ssh_url_parts(cls, git_info: git.GitProviderModel) -> tuple[str, str, int]:

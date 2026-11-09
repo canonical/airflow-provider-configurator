@@ -89,12 +89,18 @@ SSH_PASSPHRASE_NOT_SUPPORTED_MESSAGE = (
 # The git relation selected SSH authentication but supplied no private key.
 MISSING_SSH_KEY_MESSAGE = "Git relation selected SSH authentication but provided no private key"
 # The git relation selected SSH authentication but gave a URL that is not an
-# SSH one (e.g. an https:// clone URL). Caught up front because the host would
-# otherwise be parsed out of the URL wrongly and reported as an unreachable
-# host rather than as the misconfiguration it is.
+# valid SSH one (e.g. an https:// clone URL, or one with no host, path or a bad
+# port). Caught up front because the host would otherwise be parsed out of the
+# URL wrongly and reported as an unreachable host, or raise out of the hook,
+# rather than being reported as the misconfiguration it is.
 INVALID_SSH_URL_MESSAGE = (
-    "Git relation selected SSH authentication but the repository URL is not an SSH URL; "
+    "Git relation selected SSH authentication but the repository URL is not a valid SSH URL; "
     "use ssh://user@host/path or user@host:path"
+)
+# The git relation's ssh_port is not a usable TCP port (1-65535).
+INVALID_SSH_PORT_MESSAGE = (
+    "Git relation selected SSH authentication but ssh_port is not a valid port; "
+    "use a number between 1 and 65535"
 )
 # ssh-keyscan could not retrieve the host key needed for strict host-key
 # verification (host unreachable, wrong port, or ssh-keyscan unavailable).

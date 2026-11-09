@@ -663,6 +663,73 @@ class TestReconcile:
         state_out = context.run(context.on.relation_changed(relation), state)
         assert state_out.unit_status == ops.BlockedStatus(charm_module.INVALID_SSH_URL_MESSAGE)
 
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "ssh://",
+            "ssh:///example/x.git",
+            "ssh://git@",
+            "ssh://git@github.com",
+            "ssh://git@github.com/",
+            "git@github.com:",
+            "git@:example/x.git",
+            ":example/x.git",
+            "ssh://git@-oProxyCommand=x/example/x.git",
+            "-oProxyCommand=x:example/x.git",
+            "ssh://git@github.com:99999/example/x.git",
+            "ssh://git@github.com:0/example/x.git",
+            "ssh://git@github.com:abc/example/x.git",
+        ],
+    )
+    def test_ssh_blocks_when_ssh_url_is_malformed(self, context, tmp_path, ssh_key_secret, url):
+        """A malformed SSH URL blocks cleanly instead of erroring the hook.
+
+        These include URLs that name no host or no repository path, and ones whose
+        port makes ``urlsplit().port`` raise ValueError, which _reconcile does not
+        catch.
+        """
+        relation = _ssh_relation(ssh_key_secret, url=url)
+        state = ops.testing.State(
+            leader=True,
+            containers=[_ssh_synced_container(tmp_path)],
+            relations=[relation, _provider_relation()],
+            secrets=[ssh_key_secret],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        state_out = context.run(context.on.relation_changed(relation), state)
+        assert state_out.unit_status == ops.BlockedStatus(charm_module.INVALID_SSH_URL_MESSAGE)
+
+    @pytest.mark.parametrize("port", [0, -1, 65536, 70000])
+    def test_ssh_blocks_when_ssh_port_is_out_of_range(
+        self, context, tmp_path, ssh_key_secret, port
+    ):
+        """An ssh_port outside 1-65535 blocks rather than being folded into the URL."""
+        relation = _ssh_relation(ssh_key_secret, port=port)
+        state = ops.testing.State(
+            leader=True,
+            containers=[_ssh_synced_container(tmp_path)],
+            relations=[relation, _provider_relation()],
+            secrets=[ssh_key_secret],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        state_out = context.run(context.on.relation_changed(relation), state)
+        assert state_out.unit_status == ops.BlockedStatus(charm_module.INVALID_SSH_PORT_MESSAGE)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "git@github.com:example/x.git",
+            "github.com:example/x.git",
+            "ssh://git@github.com/example/x.git",
+            "ssh://git@github.com:2222/example/x.git",
+            "ssh://git@[2001:db8::1]:2222/example/x.git",
+            "ssh://github.com/example/x",
+        ],
+    )
+    def test_ssh_url_validation_accepts_well_formed_urls(self, url):
+        """Well-formed scp-style and ssh:// URLs, with or without a port, still pass."""
+        assert AirflowProviderConfiguratorCharm._is_ssh_url(url)
+
     def test_ssh_known_hosts_pinned_host_is_not_rescanned(self, context, tmp_path, ssh_key_secret):
         """An already-pinned host keeps its key, so it cannot be silently swapped.
 

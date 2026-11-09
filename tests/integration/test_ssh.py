@@ -54,7 +54,7 @@ _PEBBLE_PLAN = "/charm/bin/pebble plan"
 _PEBBLE_LOGS = "/charm/bin/pebble logs git-sync -n 200"
 
 INVALID_SSH_URL_MESSAGE = (
-    "Git relation selected SSH authentication but the repository URL is not an SSH URL; "
+    "Git relation selected SSH authentication but the repository URL is not a valid SSH URL; "
     "use ssh://user@host/path or user@host:path"
 )
 GIT_SYNC_START_FAILED_MESSAGE = (
