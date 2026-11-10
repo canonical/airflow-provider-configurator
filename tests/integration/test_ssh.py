@@ -264,9 +264,9 @@ def test_custom_ssh_port_is_folded_into_the_url_and_the_pin(juju: jubilant.Juju)
     _wait_for_rejected_key(juju)
 
 
-# This test must stay LAST. The upstream bug it trips leaves git-integrator in
-# an error state that stops it applying any further config, so every test that
-# ran after it would fail for reasons unrelated to what it checks.
+# This test is kept LAST. On git-integrator revisions before the #17 fix the
+# rotation left it in an error state that blocked any further config, so tests
+# after it would fail for unrelated reasons.
 #
 # There is deliberately no integration test for "SSH selected but no key": the
 # real provider blocks itself and publishes nothing in that case, so the charm
@@ -274,9 +274,9 @@ def test_custom_ssh_port_is_folded_into_the_url_and_the_pin(juju: jubilant.Juju)
 @pytest.mark.xfail(
     strict=False,
     reason=(
-        "git-integrator (1.0/edge rev 5) never propagates a rotated key: its "
-        "GitProviderEventHandler does not override _on_secret_changed_event, so the "
-        "abstract base raises NotImplementedError and the secret-changed hook fails. "
+        "git-integrator (1.0/edge rev 7) never propagates a rotated key: it does "
+        "not observe secret-changed or read the secret with refresh=True, so the "
+        "relation keeps the old key. See canonical/git-integrator#20. "
         "This charm rewrites the key file correctly once it is published."
     ),
 )
