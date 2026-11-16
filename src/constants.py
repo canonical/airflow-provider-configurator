@@ -13,6 +13,8 @@ PROVIDER_RELATION_NAME = "airflow-provider-configuration"
 PEER_RELATION_NAME = "replicas"
 # Key under the peer app databag holding that hash.
 PEER_CONFIG_HASH_KEY = "published-config-hash"
+APP_ID = "airflow.provider-configurator"
+PEER_SECURITY_AUDIT_DENIED_KEYS_HASH = "security-audit-denied-keys-hash"
 WORKLOAD_CONTAINER = "git-sync"
 GIT_SYNC_SERVICE = "git-sync"
 GIT_SYNC_ROOT = "/git"

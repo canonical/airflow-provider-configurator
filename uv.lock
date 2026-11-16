@@ -9,6 +9,7 @@ source = { virtual = "." }
 dependencies = [
     { name = "airflow-provider-configurator-charmlib" },
     { name = "ops" },
+    { name = "owasp-logger" },
     { name = "pydantic" },
     { name = "pyyaml" },
 ]
@@ -36,6 +37,7 @@ unit = [
 requires-dist = [
     { name = "airflow-provider-configurator-charmlib", directory = "lib" },
     { name = "ops", specifier = ">=3,<4" },
+    { name = "owasp-logger", specifier = ">=0.1.6,<0.2.0" },
     { name = "pydantic", specifier = ">=2" },
     { name = "pyyaml", specifier = ">=6" },
 ]
@@ -265,6 +267,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/f6/dd/90923eb4a47903866979a64f1451e63a78623b680d4b95b4138ff407d9e8/ops_scenario-8.8.1.tar.gz", hash = "sha256:f5c144c1c63232eb4ba6b424c50230b485dab1734ca74b25ff7b555847a6527f", size = 86670, upload-time = "2026-07-30T02:58:54.491Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/f5/f6/9918edafc6279fbc4664754e145632d4e5c8317031e0902faf8e91980e3f/ops_scenario-8.8.1-py3-none-any.whl", hash = "sha256:18ecb8a89d23658b7d04b2ef6651144f442cfe2ddcc9a82893e532ccd83a58d0", size = 74663, upload-time = "2026-07-30T02:58:50.334Z" },
+]
+
+[[package]]
+name = "owasp-logger"
+version = "0.1.6"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/0e/5f/2bb17ea9e733c7429fcb65d4f1fd3e96387aab1d9cb1f0ecb6ecf7c0228c/owasp_logger-0.1.6.tar.gz", hash = "sha256:0e9d9f2f49da149babf5dcfad65eb13ab5b7f780b3228fca2856401f39ed979d", size = 74247, upload-time = "2026-04-01T14:04:54.188Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/6d/ce/dbd340b01c6cde5f9bdfa7c572db629e5d500a8d003b522cf14c8725f0bd/owasp_logger-0.1.6-py3-none-any.whl", hash = "sha256:8ed80527f6f6c4cc86a72ec1ef399ed7ae1eca3f491b471abd1d308fa5f74129", size = 10914, upload-time = "2026-04-01T14:04:53.146Z" },
 ]
 
 [[package]]

@@ -35,6 +35,7 @@ from airflow_provider_configurator import AirflowProviderConfiguratorProvides
 
 import config_generator
 import denylist
+import security_logging
 import sensitive_config
 from constants import (
     CONFIG_FILE_PATH,
@@ -70,6 +71,7 @@ from constants import (
     MISSING_SENSITIVE_KEY_MESSAGE,
     MISSING_SSH_KEY_MESSAGE,
     PEER_CONFIG_HASH_KEY,
+    PEER_SECURITY_AUDIT_DENIED_KEYS_HASH,
     PEER_RELATION_NAME,
     PROVIDER_RELATION_NAME,
     SSH_PASSPHRASE_NOT_SUPPORTED_MESSAGE,
@@ -111,6 +113,7 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
             callback=self._reconcile,
         )
         self._container = self.unit.get_container(WORKLOAD_CONTAINER)
+        self._security_events = security_logging.ProviderSecurityLogger(self)
         self._sync_period = str(self.config[CONFIG_SYNC_PERIOD])
         self._config_provider = AirflowProviderConfiguratorProvides(self)
 
@@ -328,7 +331,15 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         the only indication that those values moved, so it must not be deduped
         away or the coordinator would keep rendering the superseded revision.
         """
-        self._reconcile(event, force_publish=True)
+        failure = self._reconcile(event, force_publish=True)
+        if failure is None and self._sensitive_secret_id:
+            self._security_events.log_configuration_change(
+                "rotate_sensitive_provider_secret",
+                {
+                    "secret_config": CONFIG_SENSITIVE_SECRET,
+                    "observed_via": "juju_secret_changed",
+                },
+            )
 
     def _config_source_removed(self) -> bool:
         """Whether the configuration source itself is gone, not just unavailable.
@@ -409,6 +420,7 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         # Compare the effective plan before and after applying the layer so the
         # comparison uses Pebble's own normalized view rather than a hand-rolled
         # diff of a raw layer against a combined plan.
+        was_running = self._security_events.is_running()
         services_before = self._container.get_plan().services
         self._container.add_layer(GIT_SYNC_SERVICE, self._git_sync_layer(git_info), combine=True)
         services_after = self._container.get_plan().services
@@ -416,12 +428,17 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
             try:
                 self._container.replan()
             except ops.pebble.ChangeError as e:
+                self._security_events.log_crash_if_error()
                 # git-sync runs with --max-failures=0, so it exits on its first
                 # failed fetch and Pebble reports the start as failed. Rejected
                 # credentials are the usual trigger, which is an operator-fixable
                 # misconfiguration rather than a charm bug, so report it as a
                 # status instead of letting the hook error out.
                 raise ExitWithStatusError(GIT_SYNC_START_FAILED_MESSAGE, ops.BlockedStatus) from e
+            if was_running:
+                self._security_events.log_restart("git_sync_service_plan_changed")
+            else:
+                self._security_events.log_startup_if_transitioned(was_running)
 
     def _stop_git_sync(self) -> None:
         """Stop the git-sync service so it doesn't keep polling a stale/unrelated repo.
@@ -435,7 +452,11 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         if not self._container.can_connect():
             return
         if GIT_SYNC_SERVICE in self._container.get_services():
+            was_running = self._security_events.is_running()
             self._container.stop(GIT_SYNC_SERVICE)
+            self._security_events.log_shutdown_if_running(
+                was_running, "configuration_source_removed"
+            )
         self._container.remove_path(GIT_SYNC_PASSWORD_FILE, recursive=True)
         self._container.remove_path(GIT_SYNC_SSH_KEY_FILE, recursive=True)
         self._container.remove_path(GIT_SYNC_KNOWN_HOSTS_FILE, recursive=True)
@@ -494,7 +515,9 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
             logger.error("Layer 2 denylist unavailable: %s", e)
             raise ExitWithStatusError(DENYLIST_UNAVAILABLE_MESSAGE, ops.BlockedStatus) from e
         self._record_dropped_keys(dropped)
+        self._log_denied_keys_once(dropped)
 
+        previous_config_hash = self._stored_config_hash
         config_hash = self._config_hash(template, self._sensitive_secret_id)
         is_empty = not template and not flat_sensitive
         # Skip when the content is unchanged AND the relations already reflect the
@@ -522,6 +545,60 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
                 provider_configuration_sensitive_data=flat_sensitive,
             )
         self._store_config_hash(config_hash)
+        if config_hash != previous_config_hash:
+            if is_empty:
+                if previous_config_hash is not None:
+                    self._security_events.log_configuration_change(
+                        "withdraw_provider_configuration",
+                        {"source": "git_repository_and_juju_secret"},
+                    )
+            else:
+                self._security_events.log_configuration_change(
+                    "create_provider_configuration"
+                    if previous_config_hash is None
+                    else "update_provider_configuration",
+                    {
+                        "configuration_fields": self._configuration_field_names(
+                            template, flat_sensitive
+                        ),
+                        "source": "git_repository_and_juju_secret",
+                    },
+                )
+
+    @staticmethod
+    def _configuration_field_names(template: str, sensitive_data: dict[str, str]) -> list[str]:
+        """Return setting names only; never include provider-supplied values in audit logs."""
+        parser = configparser.RawConfigParser()
+        parser.read_string(template)
+        fields = {
+            f"{section}.{option}"
+            for section in parser.sections()
+            for option in parser.options(section)
+        }
+        return sorted(fields | set(sensitive_data))
+
+    def _log_denied_keys_once(self, dropped: list[str]) -> None:
+        """Emit authz_fail once per distinct set of denylist-rejected keys."""
+        if not self.unit.is_leader():
+            return
+        relation = self.model.get_relation(PEER_RELATION_NAME)
+        if relation is None:
+            return
+
+        peer_data = relation.data[self.app]
+        denied_keys = sorted(set(dropped))
+        signature = (
+            hashlib.sha256(json.dumps(denied_keys).encode()).hexdigest() if denied_keys else ""
+        )
+        if signature == peer_data.get(PEER_SECURITY_AUDIT_DENIED_KEYS_HASH):
+            return
+
+        if denied_keys:
+            for key in denied_keys:
+                self._security_events.log_denied_key(key)
+            peer_data[PEER_SECURITY_AUDIT_DENIED_KEYS_HASH] = signature
+        else:
+            peer_data.pop(PEER_SECURITY_AUDIT_DENIED_KEYS_HASH, None)
 
     def _record_dropped_keys(self, dropped: list[str]) -> None:
         """Record Layer 2 drops for this hook and log a WARNING per dropped key.
