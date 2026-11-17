@@ -59,6 +59,7 @@ class ProviderSecurityLogger:
         return bool(service and service.is_running())
 
     def log_startup_if_transitioned(self, was_running: bool | None) -> None:
+        """Log git-sync startup only when a stopped service becomes running."""
         if was_running is False and self.is_running() is True:
             self._emit(
                 "sys_startup",
@@ -69,6 +70,7 @@ class ProviderSecurityLogger:
             )
 
     def log_shutdown_if_running(self, was_running: bool | None, trigger: str) -> None:
+        """Log a successful charm-requested stop of a running git-sync service."""
         if was_running:
             self._emit(
                 "sys_shutdown",
@@ -79,6 +81,7 @@ class ProviderSecurityLogger:
             )
 
     def log_restart(self, trigger: str) -> None:
+        """Log a restart after the charm's Pebble restart call succeeds."""
         self._emit(
             "sys_restart",
             ("juju-charm",),
@@ -88,6 +91,7 @@ class ProviderSecurityLogger:
         )
 
     def log_crash_if_error(self) -> None:
+        """Log a crash only when Pebble reports git-sync in ERROR state."""
         try:
             service = self._charm._container.get_services(constants.GIT_SYNC_SERVICE).get(
                 constants.GIT_SYNC_SERVICE
@@ -104,6 +108,7 @@ class ProviderSecurityLogger:
             )
 
     def log_configuration_change(self, action: str, data: dict[str, Any]) -> None:
+        """Log an administrative action on provider configuration."""
         self._emit(
             "authz_admin",
             (UNATTRIBUTED_ACTOR, action),
@@ -113,6 +118,7 @@ class ProviderSecurityLogger:
         )
 
     def log_denied_key(self, key: str) -> None:
+        """Log rejection of a provider configuration key by the denylist."""
         self._emit(
             "authz_fail",
             (UNATTRIBUTED_ACTOR, key),
