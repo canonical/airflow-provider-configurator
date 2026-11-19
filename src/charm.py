@@ -281,8 +281,11 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
             # Prerequisites not met (e.g. git relation removed): stop git-sync so
             # it doesn't keep polling a stale/unrelated repo, then report status.
             logger.error(e)
-            self._stop_git_sync()
-            if self._config_source_removed():
+            source_removed = self._config_source_removed()
+            self._stop_git_sync(
+                "configuration_source_removed" if source_removed else "git_prerequisites_not_met"
+            )
+            if source_removed:
                 # The source of the configuration is gone, so the configuration we
                 # published is no longer backed by anything. Empty the databag and
                 # revoke the secret straight away, rather than leaving the
@@ -332,7 +335,9 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         away or the coordinator would keep rendering the superseded revision.
         """
         failure = self._reconcile(event, force_publish=True)
-        if failure is None and self._sensitive_secret_id:
+        # secret-changed also fires for the git relation's credential secrets;
+        # only the configured sensitive secret is a provider-secret rotation.
+        if failure is None and self._is_sensitive_secret(event.secret):
             self._security_events.log_configuration_change(
                 "rotate_sensitive_provider_secret",
                 {
@@ -340,6 +345,21 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
                     "observed_via": "juju_secret_changed",
                 },
             )
+
+    def _is_sensitive_secret(self, secret: ops.Secret) -> bool:
+        """Whether `secret` is the configured sensitive-config user secret.
+
+        Juju may render the same secret as `secret:<id>` or
+        `secret://<model-uuid>/<id>`, so only the trailing id is compared.
+        """
+        configured = self._sensitive_secret_id
+        if not configured or not secret.id:
+            return False
+
+        def _unique_id(secret_id: str) -> str:
+            return secret_id.rsplit("/", 1)[-1].removeprefix("secret:")
+
+        return _unique_id(secret.id) == _unique_id(configured)
 
     def _config_source_removed(self) -> bool:
         """Whether the configuration source itself is gone, not just unavailable.
@@ -359,8 +379,14 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         the peer databag records the hash of what is currently published, and
         after this nothing is.
         """
+        was_published = self._stored_config_hash is not None
         self._config_provider.clear_configuration()
         self._clear_stored_config_hash()
+        if was_published and self.unit.is_leader():
+            self._security_events.log_configuration_change(
+                "withdraw_provider_configuration",
+                {"reason": "configuration_source_removed"},
+            )
 
     def _validate_prerequisites(self) -> git.GitProviderModel:
         """Check required config, the git relation, and the container are ready.
@@ -440,7 +466,7 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
             else:
                 self._security_events.log_startup_if_transitioned(was_running)
 
-    def _stop_git_sync(self) -> None:
+    def _stop_git_sync(self, reason: str) -> None:
         """Stop the git-sync service so it doesn't keep polling a stale/unrelated repo.
 
         Called when prerequisites are no longer met (e.g. the git relation was
@@ -454,9 +480,7 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         if GIT_SYNC_SERVICE in self._container.get_services():
             was_running = self._security_events.is_running()
             self._container.stop(GIT_SYNC_SERVICE)
-            self._security_events.log_shutdown_if_running(
-                was_running, "configuration_source_removed"
-            )
+            self._security_events.log_shutdown_if_running(was_running, reason)
         self._container.remove_path(GIT_SYNC_PASSWORD_FILE, recursive=True)
         self._container.remove_path(GIT_SYNC_SSH_KEY_FILE, recursive=True)
         self._container.remove_path(GIT_SYNC_KNOWN_HOSTS_FILE, recursive=True)
