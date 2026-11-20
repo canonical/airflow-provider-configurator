@@ -1790,3 +1790,97 @@ class TestSyncNowForce:
         with patch("charm.AirflowProviderConfiguratorProvides.set_configuration") as mock_set:
             context.run(context.on.action("sync-now"), state)
             mock_set.assert_called_once()
+
+
+def _running_git_sync_service():
+    """A git-sync container whose service is currently running."""
+    return ops.testing.Container(
+        name="git-sync",
+        can_connect=True,
+        layers={
+            "git-sync": ops.pebble.Layer(
+                {
+                    "services": {
+                        "git-sync": {
+                            "override": "replace",
+                            "command": "/bin/git-sync --repo=x",
+                            "startup": "enabled",
+                        }
+                    }
+                }
+            )
+        },
+        service_statuses={"git-sync": ops.pebble.ServiceStatus.ACTIVE},
+    )
+
+
+class TestSecurityEvents:
+    """OWASP security events emitted from charm reconciliation paths."""
+
+    def test_git_secret_change_is_not_logged_as_sensitive_rotation(
+        self, context, synced_container, pat_secret
+    ):
+        """Only the configured sensitive secret counts as a provider-secret rotation."""
+        from unittest.mock import patch
+
+        user_secret = ops.testing.Secret(
+            {SENSITIVE_CONFIG_KEY: json.dumps({"p": {"gcs": {"conn_id": "x"}}})}
+        )
+        state = ops.testing.State(
+            leader=True,
+            containers=[synced_container],
+            relations=[_credentials_relation(pat_secret), _provider_relation(), _peer_relation()],
+            secrets=[user_secret, pat_secret],
+            config={FILE_PATH_CONFIG: "providers.ini", SENSITIVE_SECRET_CONFIG: user_secret.id},
+        )
+        target = "security_logging.ProviderSecurityLogger.log_configuration_change"
+
+        with patch(target) as mock_log:
+            context.run(context.on.secret_changed(pat_secret), state)
+        actions = [c.args[0] for c in mock_log.call_args_list]
+        assert "rotate_sensitive_provider_secret" not in actions
+
+        with patch(target) as mock_log:
+            context.run(context.on.secret_changed(user_secret), state)
+        actions = [c.args[0] for c in mock_log.call_args_list]
+        assert "rotate_sensitive_provider_secret" in actions
+
+    @pytest.mark.parametrize(
+        "relations, expected_reason",
+        [
+            ([], "configuration_source_removed"),
+            ([_ssh_relation()], "git_prerequisites_not_met"),
+        ],
+    )
+    def test_shutdown_reason_reflects_why_git_sync_stopped(
+        self, context, relations, expected_reason
+    ):
+        from unittest.mock import patch
+
+        state = ops.testing.State(
+            leader=True,
+            containers=[_running_git_sync_service()],
+            relations=relations,
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        with patch("security_logging.ProviderSecurityLogger.log_shutdown_if_running") as mock_log:
+            context.run(context.on.update_status(), state)
+        mock_log.assert_called_once_with(True, expected_reason)
+
+    @pytest.mark.parametrize("stored_hash, expect_logged", [("published", True), (None, False)])
+    def test_source_removal_logs_withdrawal_only_if_published(
+        self, context, container, stored_hash, expect_logged
+    ):
+        from unittest.mock import patch
+
+        peer_data = {charm_module.PEER_CONFIG_HASH_KEY: stored_hash} if stored_hash else {}
+        state = ops.testing.State(
+            leader=True,
+            containers=[container],
+            relations=[_provider_relation(), _peer_relation(local_app_data=peer_data)],
+            config={FILE_PATH_CONFIG: "providers.ini"},
+        )
+        with patch("security_logging.ProviderSecurityLogger.log_configuration_change") as mock_log:
+            context.run(context.on.update_status(), state)
+        actions = [c.args[0] for c in mock_log.call_args_list]
+        assert ("withdraw_provider_configuration" in actions) is expect_logged
