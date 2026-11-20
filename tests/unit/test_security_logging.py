@@ -2,11 +2,15 @@
 
 import json
 import logging
-from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
+
+import ops
+import ops.testing
 
 from charm import AirflowProviderConfiguratorCharm
 from security_logging import ProviderSecurityLogger
+
+TARGET = "airflow-provider-configurator"
 
 
 def _event_from_log(caplog) -> dict:
@@ -15,11 +19,7 @@ def _event_from_log(caplog) -> dict:
 
 
 def test_configuration_change_emits_authz_admin_with_context(caplog):
-    charm = SimpleNamespace(
-        app=SimpleNamespace(name="airflow-provider-configurator"),
-        _container=Mock(),
-    )
-    security_logger = ProviderSecurityLogger(charm)
+    security_logger = ProviderSecurityLogger(container=Mock(), target=TARGET)
 
     with caplog.at_level(logging.WARNING, logger="security_logging"):
         security_logger.log_configuration_change(
@@ -32,7 +32,7 @@ def test_configuration_change_emits_authz_admin_with_context(caplog):
     assert event["event"] == "authz_admin:unattributed,update_provider_configuration"
     assert event["level"] == "WARN"
     assert event["actor"] == "unattributed"
-    assert event["target"] == "airflow-provider-configurator"
+    assert event["target"] == TARGET
     assert "action" not in event
     assert "outcome" not in event
     assert event["data"] == {
@@ -41,22 +41,16 @@ def test_configuration_change_emits_authz_admin_with_context(caplog):
     }
 
 
-def test_denied_key_emits_authz_fail_without_value(caplog):
-    charm = SimpleNamespace(
-        app=SimpleNamespace(name="airflow-provider-configurator"),
-        _container=Mock(),
-    )
-    security_logger = ProviderSecurityLogger(charm)
+def test_denied_key_emits_input_validation_fail_at_warn_without_value(caplog):
+    security_logger = ProviderSecurityLogger(container=Mock(), target=TARGET)
 
-    with caplog.at_level(logging.CRITICAL, logger="security_logging"):
+    with caplog.at_level(logging.WARNING, logger="security_logging"):
         security_logger.log_denied_key("api.secret_key")
 
     event = _event_from_log(caplog)
-    assert event["event"] == "authz_fail:unattributed,api.secret_key"
-    assert event["level"] == "CRITICAL"
+    assert event["event"] == "input_validation_discrete_fail:api.secret_key,unattributed"
+    assert event["level"] == "WARN"
     assert event["actor"] == "unattributed"
-    assert "action" not in event
-    assert "outcome" not in event
     assert event["data"] == {
         "actor_attribution": "repository_audit_log",
         "config_key": "api.secret_key",
@@ -64,24 +58,49 @@ def test_denied_key_emits_authz_fail_without_value(caplog):
     assert "secret-value" not in json.dumps(event)
 
 
-def test_denylist_events_are_deduplicated_until_drop_set_changes():
-    peer_app_data: dict[str, str] = {}
-    security_events = Mock()
-    app = "airflow-provider-configurator"
-    charm = SimpleNamespace(
-        unit=SimpleNamespace(is_leader=lambda: True),
-        model=SimpleNamespace(
-            get_relation=lambda relation_name: SimpleNamespace(data={app: peer_app_data})
-        ),
-        app=app,
-        _security_events=security_events,
+def test_denylist_events_are_deduplicated_until_drop_set_changes(tmp_path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    ini = repo_dir / "providers.ini"
+    container = ops.testing.Container(
+        name="git-sync",
+        can_connect=True,
+        mounts={"content": ops.testing.Mount(location="/git/repo", source=repo_dir)},
     )
+    git_relation = ops.testing.Relation(
+        "remote-airflow-provider-configurations",
+        interface="git",
+        remote_app_data={
+            "repository-url": "https://github.com/example/provider-config",
+            "tracking-ref": "main",
+        },
+    )
+    state = ops.testing.State(
+        leader=True,
+        containers=[container],
+        relations=[
+            git_relation,
+            ops.testing.Relation(
+                "airflow-provider-configuration", interface="airflow_provider_configuration"
+            ),
+            ops.testing.PeerRelation(
+                "replicas", interface="airflow_provider_configurator_replica"
+            ),
+        ],
+        config={"airflow_provider_configurations_file_path": "providers.ini"},
+    )
+    context = ops.testing.Context(charm_type=AirflowProviderConfiguratorCharm)
+    logged: list[str] = []
 
-    AirflowProviderConfiguratorCharm._log_denied_keys_once(charm, ["api.secret_key"])
-    AirflowProviderConfiguratorCharm._log_denied_keys_once(charm, ["api.secret_key"])
-    AirflowProviderConfiguratorCharm._log_denied_keys_once(charm, ["core.fernet_key"])
+    def run(ini_text: str) -> None:
+        nonlocal state
+        ini.write_text(ini_text)
+        with patch("security_logging.ProviderSecurityLogger.log_denied_key") as mock_log:
+            state = context.run(context.on.update_status(), state)
+        logged.extend(call.args[0] for call in mock_log.call_args_list)
 
-    assert [call.args[0] for call in security_events.log_denied_key.call_args_list] == [
-        "api.secret_key",
-        "core.fernet_key",
-    ]
+    run("[gcs]\nconn_id = x\n[core]\ndags_folder = /tmp/evil\n")
+    run("[gcs]\nconn_id = x\n[core]\ndags_folder = /tmp/evil\n")
+    run("[gcs]\nconn_id = x\n[core]\nplugins_folder = /tmp/evil\n")
+
+    assert logged == ["core.dags_folder", "core.plugins_folder"]
