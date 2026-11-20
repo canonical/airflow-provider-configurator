@@ -113,7 +113,9 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
             callback=self._reconcile,
         )
         self._container = self.unit.get_container(WORKLOAD_CONTAINER)
-        self._security_events = security_logging.ProviderSecurityLogger(self)
+        self._security_events = security_logging.ProviderSecurityLogger(
+            container=self._container, target=self.app.name
+        )
         self._sync_period = str(self.config[CONFIG_SYNC_PERIOD])
         self._config_provider = AirflowProviderConfiguratorProvides(self)
 
@@ -602,7 +604,7 @@ class AirflowProviderConfiguratorCharm(ops.CharmBase):
         return sorted(fields | set(sensitive_data))
 
     def _log_denied_keys_once(self, dropped: list[str]) -> None:
-        """Emit authz_fail once per distinct set of denylist-rejected keys."""
+        """Emit input_validation_discrete_fail once per distinct set of denylist-rejected keys."""
         if not self.unit.is_leader():
             return
         relation = self.model.get_relation(PEER_RELATION_NAME)
