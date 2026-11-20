@@ -35,25 +35,29 @@ class _ContextLogger(logging.LoggerAdapter):
 class ProviderSecurityLogger:
     """Emit provider-configurator administrative and git-sync lifecycle events."""
 
-    def __init__(self, charm: ops.CharmBase) -> None:
-        self._charm = charm
+    def __init__(self, container: ops.model.Container, target: str) -> None:
+        self._container = container
         self._context_logger = _ContextLogger(
             logging.getLogger(__name__),
             {
                 "appid": constants.APP_ID,
-                "target": charm.app.name,
+                "target": target,
                 "actor": UNATTRIBUTED_ACTOR,
                 "data": {},
             },
         )
         self._owasp_logger = OWASPLogger(appid=constants.APP_ID, logger=self._context_logger)
 
+    def _git_sync_service(self) -> ops.pebble.ServiceInfo | None:
+        """Return git-sync's Pebble service info; raise if Pebble cannot be queried."""
+        return self._container.get_services(constants.GIT_SYNC_SERVICE).get(
+            constants.GIT_SYNC_SERVICE
+        )
+
     def is_running(self) -> bool | None:
         """Return git-sync state, or None if Pebble cannot be queried."""
         try:
-            service = self._charm._container.get_services(constants.GIT_SYNC_SERVICE).get(
-                constants.GIT_SYNC_SERVICE
-            )
+            service = self._git_sync_service()
         except (ops.pebble.APIError, ops.pebble.ConnectionError):
             return None
         return bool(service and service.is_running())
@@ -93,9 +97,7 @@ class ProviderSecurityLogger:
     def log_crash_if_error(self) -> None:
         """Log a crash only when Pebble reports git-sync in ERROR state."""
         try:
-            service = self._charm._container.get_services(constants.GIT_SYNC_SERVICE).get(
-                constants.GIT_SYNC_SERVICE
-            )
+            service = self._git_sync_service()
         except (ops.pebble.APIError, ops.pebble.ConnectionError):
             return
         if service and service.current == ops.pebble.ServiceStatus.ERROR:
@@ -118,10 +120,15 @@ class ProviderSecurityLogger:
         )
 
     def log_denied_key(self, key: str) -> None:
-        """Log rejection of a provider configuration key by the denylist."""
+        """Log rejection of a provider configuration key by the denylist.
+
+        A key committed to the git repository is invalid input to a policy check,
+        not an access attempt, so this is an input-validation failure (WARN) rather
+        than authz_fail (CRITICAL).
+        """
         self._emit(
-            "authz_fail",
-            (UNATTRIBUTED_ACTOR, key),
+            "input_validation_discrete_fail",
+            (key, UNATTRIBUTED_ACTOR),
             UNATTRIBUTED_ACTOR,
             "Provider configuration key rejected by the denylist.",
             config_key=key,
@@ -154,6 +161,4 @@ class ProviderSecurityLogger:
         )
 
     def _clear_context(self) -> None:
-        self._context_logger.extra.update(
-            {"actor": UNATTRIBUTED_ACTOR, "data": {}}
-        )
+        self._context_logger.extra.update({"actor": UNATTRIBUTED_ACTOR, "data": {}})
